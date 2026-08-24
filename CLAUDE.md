@@ -46,9 +46,21 @@ A new capability requires changes in **three places**, kept in sync by the `acti
 
 Painting/drawing commands (`stroke`, `fill`, `draw_shape`, `clear`, `new_canvas`) manipulate pixel data
 directly via `layer.setPixelData()` in **BGRA byte order**, not Krita's native brush engine — this
-keeps behavior independent of brush/tool state in the UI. `set_brush` is the one exception that does
-touch Krita's real brush preset (currently unused by `stroke`, kept for future native-brush support).
-After any pixel write, call `doc.refreshProjection()` to update the canvas view.
+keeps behavior independent of brush/tool state in the UI, at the cost of never reflecting the active
+brush preset's actual texture (bristles, scatter, tip shape). `stroke_native` is the counterpart that
+*does* go through the real engine (`Node.paintLine`), for when a preset's texture matters (fur/latex
+brushes — see the `krita-shading-technique` skill in the hub). After any pixel write, call
+`doc.refreshProjection()` to update the canvas view.
+
+Not every capability belongs behind the HTTP command queue. `KritaMCPExtension.createActions()`
+also registers a couple of native Krita menu actions (Tools → Scripts) that call the same
+underlying logic directly on the main thread — no HTTP round-trip, no Claude/MCP required. Add a
+menu action there instead of (or alongside) an `action`/`cmd_*` pair when the capability is
+genuinely useful to a plain Krita user with no per-call parameters to supply (toggling a flag,
+running a fixed operation on the current selection). Skip it for anything that only makes sense as
+scripted/AI-driven input — a human already has a better native equivalent (painting normally with
+the brush tool instead of `stroke_native`; Krita's own Enclose-and-Fill tool instead of
+`flood_fill`).
 
 Because painting bypasses Krita's brush engine, it also bypasses Krita's native selection clipping.
 `stroke`/`fill`/`draw_shape` (rect/ellipse) compensate by reading `doc.selection().pixelData(...)`
@@ -82,6 +94,24 @@ both HTTP-request timeout (`server.py`'s `send_command(..., timeout=120.0)`) and
 queue wait (`CommandQueue.get_result(..., timeout=120)`) must be raised **together** — raising only one
 side just moves where the timeout fires. See README "The Export Timeout Fix" for the full explanation
 if extending this pattern to other slow commands.
+
+**`doc.setBatchmode(True)` does not suppress every export dialog.** It works for
+`Document.exportImage()` (what `get_canvas`/`save` use) but `Node.save()` shows Krita's PNG/JPG
+export-options dialog regardless of batchmode, which blocks Krita's entire event loop — not just
+the HTTP request — until a human clicks it, hanging the whole app from the plugin's perspective.
+Confirmed live: `cmd_export_layer` originally used `Node.save()` and froze Krita this way twice
+before being rewritten to build a `QImage` from `node.pixelData()` and save via Qt's own
+`QImage.save()`, which never touches Krita's importer/exporter UI at all. Prefer that pattern —
+read pixels yourself and save via `QImage`/Qt — over `Node.save()` for any new single-node export
+command; don't assume `setBatchmode` protects a command just because it worked for `get_canvas`.
+
+## Known API quirks
+
+- **`QByteArray` indexing returns `bytes`, not `int`, on this PyQt5/sip build.** Any code that
+  reads `pixelData()`/`projectionPixelData()`/etc. and indexes it directly (`data[i]`) needs to
+  wrap it in `bytearray(...)` first, or per-pixel math and `"{:02x}".format()`-style calls break.
+  Bit `cmd_get_color_at` once (pre-existing bug, fixed by wrapping in `bytearray()`) — check any
+  new raw pixel read for the same mistake.
 
 ## Configuration
 

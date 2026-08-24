@@ -125,6 +125,31 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 | `krita_flatten_image` | Flatten all layers |
 | `krita_export_layer` | Export a single layer to an image file |
 
+**Texture brushes, smart fill, clipping, vector**
+
+| Tool | Description |
+|------|-------------|
+| `krita_stroke_native` | Stroke using Krita's real brush engine (respects the active preset's texture/bristles — for fur/latex-style presets, unlike `stroke`'s pixel-direct soft circle) |
+| `krita_flood_fill` | Scripted boundary-aware fill from a seed point (for AI use — a human should use Krita's own Enclose-and-Fill tool instead) |
+| `krita_set_layer_clipping` | Clip a layer's paint to the layer beneath (standard shading technique) |
+| `krita_create_layer(type="fill", generator=...)` | Non-destructive fill layer (gradient/pattern/color) |
+| `krita_add_svg_shapes` / `krita_export_layer_svg` / `krita_list_shapes` | Import/export/inspect vector shapes on a vector layer |
+
+`krita-shading-technique` (a Claude Code skill, see `plugins/krita/skills/` in the AIHelpers hub)
+covers building fur/latex brush presets and structuring a shading layer stack with these tools.
+
+### Native menu actions (no AI/MCP required)
+
+The plugin also registers two plain Krita menu actions (Tools → Scripts), usable without Claude or
+this MCP server at all:
+
+- **MCP: Toggle Clip to Layer Below** — toggles clipping on the active layer.
+- **MCP: Fill Selection with Gradient (FG→BG)** — adds a gradient fill layer over the current
+  selection (or whole canvas).
+
+Everything else stays MCP-only by design: `flood_fill`/`stroke_native` are for scripted/AI use —
+a human already has Krita's native fill tool and paints with the brush tool directly.
+
 ## The Export Timeout Fix
 
 **This is the main reason this repo exists.**

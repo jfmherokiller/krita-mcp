@@ -4,8 +4,8 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPointF, QRectF
-from PyQt5.QtGui import QColor
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF
+from PyQt5.QtGui import QColor, QImage
 from PyQt5.QtWidgets import QMessageBox
 import json
 import threading
@@ -97,7 +97,9 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
                     "list_filters", "apply_filter",
                     "document_info", "set_color_space", "list_color_profiles",
                     "list_documents", "close_document", "resize_canvas", "crop_canvas",
-                    "flatten_image", "export_layer"
+                    "flatten_image", "export_layer",
+                    "stroke_native", "flood_fill", "set_layer_clipping",
+                    "add_svg_shapes", "export_layer_svg", "list_shapes"
                 ]
             })
         else:
@@ -177,6 +179,46 @@ class KritaMCPExtension(Extension):
             self.timer = QTimer()
             self.timer.timeout.connect(self.process_commands)
             self.timer.start(50)  # Check every 50ms
+
+        # Native menu actions — usable without Claude/MCP at all, for a plain Krita user.
+        # Only actions that make sense as a single click with no per-call parameters belong
+        # here; scripted-only capabilities (flood_fill, stroke_native) stay HTTP-only, since a
+        # human already has Krita's own (better) tools for the interactive equivalent.
+        toggle_clip_action = window.createAction(
+            "kritamcp_toggle_clip", "MCP: Toggle Clip to Layer Below", "tools/scripts"
+        )
+        toggle_clip_action.triggered.connect(self.action_toggle_clip)
+
+        gradient_fill_action = window.createAction(
+            "kritamcp_gradient_fill", "MCP: Fill Selection with Gradient (FG→BG)", "tools/scripts"
+        )
+        gradient_fill_action.triggered.connect(self.action_gradient_fill_selection)
+
+    def action_toggle_clip(self):
+        """Menu action: toggle 'clip to layer below' on the active layer."""
+        doc = self.get_active_document()
+        if not doc:
+            return
+        node = doc.activeNode()
+        if not node:
+            return
+        node.setInheritAlpha(not node.inheritAlpha())
+        doc.refreshProjection()
+
+    def action_gradient_fill_selection(self):
+        """Menu action: add a gradient fill layer over the current selection (or whole canvas)."""
+        doc = self.get_active_document()
+        if not doc:
+            return
+        selection = doc.selection()
+        if selection is None:
+            selection = Selection()
+            selection.select(0, 0, doc.width(), doc.height(), 255)
+        node = doc.createFillLayer("Gradient Fill", "gradient", InfoObject(), selection)
+        if node:
+            root = doc.rootNode()
+            root.addChildNode(node, None)
+            doc.refreshProjection()
 
     def process_commands(self):
         """Process commands from queue in main thread."""
@@ -278,6 +320,18 @@ class KritaMCPExtension(Extension):
                 return self.cmd_flatten_image(params)
             elif action == "export_layer":
                 return self.cmd_export_layer(params)
+            elif action == "stroke_native":
+                return self.cmd_stroke_native(params)
+            elif action == "flood_fill":
+                return self.cmd_flood_fill(params)
+            elif action == "set_layer_clipping":
+                return self.cmd_set_layer_clipping(params)
+            elif action == "add_svg_shapes":
+                return self.cmd_add_svg_shapes(params)
+            elif action == "export_layer_svg":
+                return self.cmd_export_layer_svg(params)
+            elif action == "list_shapes":
+                return self.cmd_list_shapes(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -517,6 +571,140 @@ class KritaMCPExtension(Extension):
         doc.refreshProjection()
 
         return {"status": "ok", "points_count": len(points), "hardness": hardness}
+
+    def cmd_stroke_native(self, params):
+        """
+        Paint a stroke using Krita's real brush engine (Node.paintLine), not the pixel-direct
+        soft-circle renderer `stroke` uses. Respects the active view's brush preset — its texture,
+        bristle scatter, spacing, etc. — so a real fur/latex brush preset actually looks like one.
+        Call set_brush first to pick a preset; this is meaningless with the default round brush.
+        """
+        points = params.get("points", [])
+        if len(points) < 2:
+            return {"error": "Need at least 2 points for a stroke"}
+        pressure = params.get("pressure", 1.0)
+
+        layer = self.get_active_layer()
+        if not layer:
+            return {"error": "No active layer"}
+        doc = self.get_active_document()
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+
+        for i in range(1, len(points)):
+            p1 = QPoint(int(round(points[i - 1][0])), int(round(points[i - 1][1])))
+            p2 = QPoint(int(round(points[i][0])), int(round(points[i][1])))
+            layer.paintLine(p1, p2, pressure, pressure)
+
+        doc.refreshProjection()
+        return {"status": "ok", "points_count": len(points)}
+
+    def cmd_flood_fill(self, params):
+        """
+        Flood-fill from a seed point with the current foreground color, for scripted/AI use where
+        there's no human to click Krita's native (and much faster) Enclose-and-Fill tool.
+
+        Pure-Python scanline fill — bounded by the active selection if one exists, otherwise by
+        explicit bounds_x/y/width/height, otherwise the active layer's own content bounds, and
+        capped at 4,000,000 px for performance. Make a selection around the area first on a large
+        canvas.
+        """
+        x, y = params.get("x"), params.get("y")
+        if x is None or y is None:
+            return {"error": "x and y are required"}
+        tolerance = params.get("tolerance", 20)
+        contiguous = params.get("contiguous", True)
+
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        layer = self.get_active_layer()
+        if not layer:
+            return {"error": "No active layer"}
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+
+        selection = doc.selection()
+        if selection:
+            bx, by, bw, bh = selection.x(), selection.y(), selection.width(), selection.height()
+        elif "bounds_width" in params and "bounds_height" in params:
+            bw, bh = params["bounds_width"], params["bounds_height"]
+            bx = params.get("bounds_x", max(0, x - bw // 2))
+            by = params.get("bounds_y", max(0, y - bh // 2))
+        else:
+            b = layer.bounds()
+            bx, by, bw, bh = b.x(), b.y(), b.width(), b.height()
+
+        MAX_PIXELS = 4_000_000
+        if bw <= 0 or bh <= 0:
+            return {"error": "Fill bounds are empty"}
+        if bw * bh > MAX_PIXELS:
+            return {"error": f"Fill region too large ({bw}x{bh} = {bw*bh}px, cap {MAX_PIXELS}). Select a smaller area first."}
+        if not (bx <= x < bx + bw and by <= y < by + bh):
+            return {"error": "Seed point (x, y) is outside the fill bounds"}
+
+        fg = view.foregroundColor()
+        qcolor = fg.colorForCanvas(view.canvas())
+        fr, fgc, fb = qcolor.red(), qcolor.green(), qcolor.blue()
+
+        original = bytes(layer.pixelData(bx, by, bw, bh))  # read-only snapshot for matching
+        pixels = bytearray(original)  # working copy we paint into
+        sel_mask = self.get_selection_mask(doc, bx, by, bw, bh)
+
+        def orig_px(i):
+            idx = i * 4
+            return original[idx + 2], original[idx + 1], original[idx], original[idx + 3]
+
+        seed_idx = (y - by) * bw + (x - bx)
+        seed_r, seed_g, seed_b, seed_a = orig_px(seed_idx)
+
+        def matches(i):
+            r, g, b, a = orig_px(i)
+            return (
+                abs(r - seed_r) <= tolerance
+                and abs(g - seed_g) <= tolerance
+                and abs(b - seed_b) <= tolerance
+                and abs(a - seed_a) <= tolerance
+            )
+
+        def paint(i):
+            sel_alpha = sel_mask[i] if sel_mask else 255
+            if sel_alpha == 0:
+                return
+            idx = i * 4
+            blend = sel_alpha / 255.0
+            pixels[idx] = int(pixels[idx] * (1 - blend) + fb * blend)
+            pixels[idx + 1] = int(pixels[idx + 1] * (1 - blend) + fgc * blend)
+            pixels[idx + 2] = int(pixels[idx + 2] * (1 - blend) + fr * blend)
+            pixels[idx + 3] = max(pixels[idx + 3], sel_alpha)
+
+        filled = 0
+        if contiguous:
+            visited = bytearray(bw * bh)
+            stack = [seed_idx]
+            visited[seed_idx] = 1
+            while stack:
+                i = stack.pop()
+                paint(i)
+                filled += 1
+                row, col = divmod(i, bw)
+                for n in (i - 1 if col > 0 else -1, i + 1 if col < bw - 1 else -1,
+                          i - bw if row > 0 else -1, i + bw if row < bh - 1 else -1):
+                    if n >= 0 and not visited[n]:
+                        visited[n] = 1
+                        if matches(n):
+                            stack.append(n)
+        else:
+            for i in range(bw * bh):
+                if matches(i):
+                    paint(i)
+                    filled += 1
+
+        layer.setPixelData(bytes(pixels), bx, by, bw, bh)
+        doc.refreshProjection()
+        return {"status": "ok", "filled_pixels": filled, "bounds": {"x": bx, "y": by, "width": bw, "height": bh}}
 
     def cmd_fill(self, params):
         """Fill a circular area with current color."""
@@ -816,7 +1004,9 @@ class KritaMCPExtension(Extension):
 
         # Get projection pixel data at point
         layer = doc.rootNode()
-        pixel_data = layer.projectionPixelData(x, y, 1, 1)
+        # bytearray(), not raw QByteArray — indexing a QByteArray yields 1-byte `bytes`
+        # objects on this PyQt5/sip version, not int, which breaks "{:02x}".format() below.
+        pixel_data = bytearray(layer.projectionPixelData(x, y, 1, 1))
 
         if len(pixel_data) >= 4:
             # RGBA
@@ -867,7 +1057,7 @@ class KritaMCPExtension(Extension):
 
     # --- Layers ---
 
-    LAYER_TYPE_ALIASES = {"paint": "paintlayer", "group": "grouplayer", "vector": "vectorlayer"}
+    LAYER_TYPE_ALIASES = {"paint": "paintlayer", "group": "grouplayer", "vector": "vectorlayer", "fill": "filllayer"}
 
     def _node_info(self, node):
         return {
@@ -902,6 +1092,18 @@ class KritaMCPExtension(Extension):
             node = doc.createGroupLayer(name)
         elif node_type == "vectorlayer":
             node = doc.createVectorLayer(name)
+        elif node_type == "filllayer":
+            generator = params.get("generator")
+            if not generator:
+                return {"error": "type='fill' requires a 'generator' param, e.g. 'gradient', 'pattern', 'color' (see list_filters — generator config keys are generator-specific)"}
+            config = InfoObject()
+            if params.get("config"):
+                config.setProperties(params["config"])
+            selection = doc.selection()
+            if selection is None:
+                selection = Selection()
+                selection.select(0, 0, doc.width(), doc.height(), 255)
+            node = doc.createFillLayer(name, generator, config, selection)
         else:
             node = doc.createNode(name, node_type)
 
@@ -1020,6 +1222,21 @@ class KritaMCPExtension(Extension):
         parent.addChildNode(node, target)
         doc.refreshProjection()
         return {"status": "ok", "name": params.get("name"), "direction": direction}
+
+    def cmd_set_layer_clipping(self, params):
+        """
+        Toggle 'clip to layer below' (Node.setInheritAlpha) — confines this layer's paint to the
+        alpha of the layer beneath it. Standard technique for keeping a shading/highlight layer
+        inside existing line art without needing a selection.
+        """
+        doc = self.get_active_document()
+        node = self.find_node(doc, params.get("name"))
+        if not node:
+            return {"error": f"Layer not found: {params.get('name')}"}
+        clip = params.get("clip", True)
+        node.setInheritAlpha(clip)
+        doc.refreshProjection()
+        return {"status": "ok", "name": params.get("name"), "clip": clip}
 
     # --- Selections ---
 
@@ -1192,6 +1409,8 @@ class KritaMCPExtension(Extension):
             if not target:
                 return {"error": "No active document"}
         closed_name = target.name()
+        # Guard against a "save changes?" prompt blocking the event loop, same as export_layer.
+        target.setBatchmode(True)
         target.close()
         return {"status": "ok", "name": closed_name}
 
@@ -1238,8 +1457,90 @@ class KritaMCPExtension(Extension):
         node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
         if not node:
             return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
-        node.save(path, doc.xRes(), doc.yRes(), InfoObject())
-        return {"status": "ok", "name": node.name(), "path": path}
+
+        # Node.save() shows Krita's PNG/JPG export-options dialog regardless of
+        # doc.setBatchmode() — unlike Document.exportImage(), which get_canvas/save already
+        # use safely. Building the QImage ourselves and saving via Qt (not Krita's importer/
+        # exporter) sidesteps that dialog entirely.
+        bounds = node.bounds()
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return {"error": f"Layer '{node.name()}' has no content to export"}
+
+        pixel_data = node.pixelData(bounds.x(), bounds.y(), bounds.width(), bounds.height())
+        image = QImage(pixel_data, bounds.width(), bounds.height(), QImage.Format_ARGB32)
+        if not image.save(path):
+            return {"error": f"Failed to save image to {path}"}
+
+        return {
+            "status": "ok",
+            "name": node.name(),
+            "path": path,
+            "width": bounds.width(),
+            "height": bounds.height(),
+        }
+
+    # --- Vector / SVG ---
+
+    def cmd_add_svg_shapes(self, params):
+        """Add shapes parsed from an SVG string to a vector layer (default: active layer)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        svg = params.get("svg")
+        if not svg:
+            return {"error": "No svg content provided"}
+        layer_name = params.get("layer")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        if node.type() != "vectorlayer":
+            return {"error": f"Layer '{node.name()}' is not a vector layer"}
+        shapes = node.addShapesFromSvg(svg)
+        doc.refreshProjection()
+        return {"status": "ok", "layer": node.name(), "shapes_added": len(shapes)}
+
+    def cmd_export_layer_svg(self, params):
+        """Export a vector layer's contents as SVG markup (default: active layer)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        layer_name = params.get("layer") or params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        if node.type() != "vectorlayer":
+            return {"error": f"Layer '{node.name()}' is not a vector layer"}
+        return {"status": "ok", "layer": node.name(), "svg": node.toSvg()}
+
+    def cmd_list_shapes(self, params):
+        """List vector shapes (name, type, bounding box) in a vector layer (default: active layer)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        layer_name = params.get("layer") or params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        if node.type() != "vectorlayer":
+            return {"error": f"Layer '{node.name()}' is not a vector layer"}
+        shapes = node.shapes()
+        return {
+            "status": "ok",
+            "layer": node.name(),
+            "shapes": [
+                {
+                    "name": s.name(),
+                    "type": s.type(),
+                    "bounds": {
+                        "x": s.boundingBox().x(),
+                        "y": s.boundingBox().y(),
+                        "width": s.boundingBox().width(),
+                        "height": s.boundingBox().height(),
+                    },
+                }
+                for s in shapes
+            ],
+        }
 
 
 # Register the extension

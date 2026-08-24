@@ -356,18 +356,31 @@ def krita_list_layers() -> str:
 
 
 @mcp.tool()
-def krita_create_layer(name: str = "New Layer", type: str = "paint", parent: Optional[str] = None) -> str:
+def krita_create_layer(
+    name: str = "New Layer",
+    type: str = "paint",
+    parent: Optional[str] = None,
+    generator: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> str:
     """
     Create a new layer.
 
     Args:
         name: Layer name
-        type: "paint", "group", or "vector"
+        type: "paint", "group", "vector", or "fill" (a non-destructive generator layer)
         parent: Name of an existing group layer to nest inside (default: top level)
+        generator: Required when type="fill" — e.g. "gradient", "pattern", "color"
+        config: Generator-specific config dict when type="fill" (keys vary by generator;
+            omit for Krita's default). Fills the current selection, or the whole canvas if none.
     """
     params = {"name": name, "type": type}
     if parent:
         params["parent"] = parent
+    if generator:
+        params["generator"] = generator
+    if config:
+        params["config"] = config
     result = send_command("create_layer", params)
 
     if "error" in result:
@@ -711,6 +724,133 @@ def krita_export_layer(path: str, name: Optional[str] = None) -> str:
     if "error" in result:
         return f"Error: {result['error']}"
     return f"Exported layer '{result.get('name')}' to {result.get('path')}"
+
+
+# --- Native brush / smart fill / clipping / vector ---
+
+@mcp.tool()
+def krita_stroke_native(points: list[list[int]], pressure: float = 1.0) -> str:
+    """
+    Paint a stroke using Krita's real brush engine (respects the active brush preset's texture,
+    bristles, scatter, spacing — e.g. an actual fur or latex-shine brush). Call krita_set_brush
+    first to pick a preset; unlike krita_stroke, this is meaningless with no preset set beyond
+    Krita's default round brush.
+
+    Args:
+        points: List of [x, y] coordinate pairs
+        pressure: Simulated pen pressure (0.0 to 1.0)
+    """
+    if len(points) < 2:
+        return "Error: Need at least 2 points for a stroke"
+
+    result = send_command("stroke_native", {"points": points, "pressure": pressure})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Native stroke painted with {len(points)} points"
+
+
+@mcp.tool()
+def krita_flood_fill(
+    x: int,
+    y: int,
+    tolerance: int = 20,
+    contiguous: bool = True,
+    bounds_x: Optional[int] = None,
+    bounds_y: Optional[int] = None,
+    bounds_width: Optional[int] = None,
+    bounds_height: Optional[int] = None,
+) -> str:
+    """
+    Flood-fill from a seed point with the current foreground color. For scripted use — a human
+    should use Krita's own (much faster) Enclose-and-Fill tool instead.
+
+    This is a pure-Python scanline fill, capped at 4,000,000px for performance. Bounded by the
+    active selection if one exists; otherwise pass bounds_width/height (+ optional bounds_x/y) to
+    scope it, or it falls back to the active layer's own content bounds. On a large canvas, make
+    a selection around the target area first.
+
+    Args:
+        x, y: Seed point (canvas coordinates)
+        tolerance: Max per-channel color distance (0-255) to still count as "connected"
+        contiguous: True = classic flood fill; False = replace all matching pixels in bounds
+        bounds_x, bounds_y, bounds_width, bounds_height: Explicit fill region (ignored if a
+            selection is active)
+    """
+    params = {"x": x, "y": y, "tolerance": tolerance, "contiguous": contiguous}
+    if bounds_width is not None:
+        params["bounds_width"] = bounds_width
+    if bounds_height is not None:
+        params["bounds_height"] = bounds_height
+    if bounds_x is not None:
+        params["bounds_x"] = bounds_x
+    if bounds_y is not None:
+        params["bounds_y"] = bounds_y
+
+    result = send_command("flood_fill", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Filled {result.get('filled_pixels')} pixels within {result.get('bounds')}"
+
+
+@mcp.tool()
+def krita_set_layer_clipping(name: str, clip: bool = True) -> str:
+    """
+    Toggle 'clip to layer below' on a layer — confines its paint to the alpha of the layer
+    beneath it. Standard technique for keeping a shading/highlight layer inside line art.
+    """
+    result = send_command("set_layer_clipping", {"name": name, "clip": clip})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Layer '{name}' clip-to-below set to {clip}"
+
+
+@mcp.tool()
+def krita_add_svg_shapes(svg: str, layer: Optional[str] = None) -> str:
+    """
+    Add shapes parsed from an SVG string to a vector layer (must already exist — see
+    krita_create_layer with type="vector").
+
+    Args:
+        svg: SVG markup (a <svg>...</svg> document, or a fragment of path/shape elements)
+        layer: Vector layer name (default: active layer)
+    """
+    params = {"svg": svg}
+    if layer:
+        params["layer"] = layer
+    result = send_command("add_svg_shapes", params)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Added {result.get('shapes_added')} shape(s) to '{result.get('layer')}'"
+
+
+@mcp.tool()
+def krita_export_layer_svg(layer: Optional[str] = None) -> str:
+    """Export a vector layer's contents as SVG markup (default: active layer)."""
+    result = send_command("export_layer_svg", {"layer": layer} if layer else {})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return result.get("svg", "")
+
+
+@mcp.tool()
+def krita_list_shapes(layer: Optional[str] = None) -> str:
+    """List vector shapes (name, type, bounding box) in a vector layer (default: active layer)."""
+    result = send_command("list_shapes", {"layer": layer} if layer else {})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    shapes = result.get("shapes", [])
+    if not shapes:
+        return "No shapes"
+    return "\n".join(
+        f"  - {s['name']} [{s['type']}] bounds={s['bounds']}" for s in shapes
+    )
 
 
 if __name__ == "__main__":
