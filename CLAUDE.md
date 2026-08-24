@@ -50,6 +50,31 @@ keeps behavior independent of brush/tool state in the UI. `set_brush` is the one
 touch Krita's real brush preset (currently unused by `stroke`, kept for future native-brush support).
 After any pixel write, call `doc.refreshProjection()` to update the canvas view.
 
+Because painting bypasses Krita's brush engine, it also bypasses Krita's native selection clipping.
+`stroke`/`fill`/`draw_shape` (rect/ellipse) compensate by reading `doc.selection().pixelData(...)`
+themselves via `KritaMCPExtension.get_selection_mask()` and blending each pixel write by the
+selection's per-pixel alpha — see that method and its call sites before changing selection behavior
+or adding another pixel-writing command that should respect an active selection.
+
+`Node.name()` is not guaranteed unique — `find_node()`/`doc.nodeByName()` return the first match.
+Layer tools that take a `name` param (`set_active_layer`, `delete_layer`, `create_layer`'s `parent`,
+etc.) inherit this ambiguity; there's no by-ID lookup exposed yet (`Node.uniqueId()` exists in the
+Krita API but isn't threaded through).
+
+## Krita Python API reference
+
+`C:\Users\peter\scoop\apps\krita\<version>\lib\krita-python-libs\PyKrita\krita.pyi` is the authoritative,
+version-matched method listing for whatever Krita is actually installed — prefer it over the online
+docs at apidoc.krita.maou-maou.fr (generated from Krita's master branch, so it can list methods newer
+than a given stable release). Both cover the same classes: `Document`, `Node` (and its `GroupLayer`/
+`VectorLayer`/etc. subclasses), `Selection`, `Krita`, `View`, `Window`, `Canvas`, `Filter`.
+
+Plugin code changes require **restarting Krita** to take effect — Python Plugin Manager has no
+hot-reload. There's no way to test a plugin edit from this MCP server itself; after editing
+`krita-plugin/kritamcp/__init__.py`, the user has to restart Krita before the new behavior is live
+(the pykrita plugin directory is normally symlinked to this repo's `krita-plugin/`, so no copy step
+is needed — just the restart).
+
 ## The export timeout fix
 
 Canvas export (`get_canvas`) and file save (`save`) are the one place a naive implementation breaks:
