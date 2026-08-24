@@ -1,0 +1,65 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+An MCP server that lets an AI paint inside a running [Krita](https://krita.org/) instance. It has
+two halves that must be developed and versioned together:
+
+1. **`server.py`** — a [FastMCP](https://github.com/jlowin/fastmcp) server (stdio transport) exposing
+   `krita_*` tools. Runs as a normal Python process launched by the MCP client (Claude Desktop, etc.).
+2. **`krita-plugin/kritamcp/__init__.py`** — a Krita Python plugin (uses the `krita` and `PyQt5` APIs,
+   only importable from *inside* Krita's embedded interpreter) that runs an `HTTPServer` on
+   `localhost:5678` in a background `QThread`.
+
+They talk over plain HTTP/JSON: `server.py` POSTs `{"action": ..., "params": {...}}` to
+`http://localhost:5678`, the plugin queues it, executes it on Krita's main thread (via a `QTimer`
+polling every 50ms — Krita's document/canvas API is not thread-safe), and returns JSON.
+
+```
+MCP Client → server.py (FastMCP, stdio) → HTTP :5678 → CommandQueue → Krita main thread → krita API
+```
+
+## Commands
+
+```bash
+uv sync                  # install/update deps into .venv (from pyproject.toml/uv.lock)
+uv run server.py         # run the MCP server directly (stdio — will block waiting for a client)
+uv add <package>         # add a new dependency (updates pyproject.toml + uv.lock)
+uv lock                  # re-resolve uv.lock after manual pyproject.toml edits
+```
+
+There is no test suite, linter, or build step. The Krita-plugin half (`krita-plugin/kritamcp/`) has
+no package manager of its own — it's deployed by copying the folder into Krita's `pykrita/` directory
+(see README "Setup" section) and can only be exercised by running it inside real Krita, not via `uv run`.
+
+## Adding a new tool
+
+A new capability requires changes in **three places**, kept in sync by the `action` string name:
+
+1. `server.py` — new `@mcp.tool()` function that calls `send_command("your_action", {...})`.
+2. `krita-plugin/kritamcp/__init__.py` `KritaMCPExtension.execute_command()` — add an `elif action ==
+   "your_action":` dispatch branch.
+3. A `cmd_your_action(self, params)` method implementing it, using `self.get_active_document()` /
+   `get_active_view()` / `get_active_layer()` helpers.
+
+Painting/drawing commands (`stroke`, `fill`, `draw_shape`, `clear`, `new_canvas`) manipulate pixel data
+directly via `layer.setPixelData()` in **BGRA byte order**, not Krita's native brush engine — this
+keeps behavior independent of brush/tool state in the UI. `set_brush` is the one exception that does
+touch Krita's real brush preset (currently unused by `stroke`, kept for future native-brush support).
+After any pixel write, call `doc.refreshProjection()` to update the canvas view.
+
+## The export timeout fix
+
+Canvas export (`get_canvas`) and file save (`save`) are the one place a naive implementation breaks:
+both HTTP-request timeout (`server.py`'s `send_command(..., timeout=120.0)`) and the plugin's command
+queue wait (`CommandQueue.get_result(..., timeout=120)`) must be raised **together** — raising only one
+side just moves where the timeout fires. See README "The Export Timeout Fix" for the full explanation
+if extending this pattern to other slow commands.
+
+## Configuration
+
+- `KRITA_URL` env var (server.py side) — defaults to `http://localhost:5678`.
+- `SERVER_PORT` / `CANVAS_OUTPUT_DIR` constants at the top of `krita-plugin/kritamcp/__init__.py`
+  (plugin side) — must match `KRITA_URL`'s port if changed.
