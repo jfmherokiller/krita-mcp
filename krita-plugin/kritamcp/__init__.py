@@ -6,7 +6,7 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 from krita import *
 from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF
 from PyQt5.QtGui import QColor, QImage
-from PyQt5.QtWidgets import QMessageBox
+from PyQt5.QtWidgets import QMessageBox, QApplication
 import json
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -401,6 +401,21 @@ class KritaMCPExtension(Extension):
             if all(k.lower() in text for k in keywords):
                 return action
         return None
+
+    def set_current_time_sync(self, doc, time):
+        """
+        doc.setCurrentTime() is asynchronous — Krita's internal frame-change signal runs on a
+        queued connection, so doc.currentTime() (and anything that depends on "which frame is
+        current," like hasKeyframeAtTime/addShapesFromSvg/the timeline's Create Blank Frame
+        action) can still reflect the OLD frame immediately after the call returns. Confirmed
+        live: a bare setCurrentTime(5) followed immediately by currentTime() in the same command
+        handler returned 0, while a later, separate command correctly saw 5.
+
+        Pumping the event loop here forces Krita's queued time-changed handlers to run before
+        this function returns, so callers can rely on the frame having actually switched.
+        """
+        doc.setCurrentTime(time)
+        QApplication.processEvents()
 
     def cmd_new_canvas(self, params):
         """Create a new canvas."""
@@ -1602,7 +1617,7 @@ class KritaMCPExtension(Extension):
         time = params.get("time")
         if time is None:
             return {"error": "time is required"}
-        doc.setCurrentTime(time)
+        self.set_current_time_sync(doc, time)
         return {"status": "ok", "currentTime": doc.currentTime()}
 
     def cmd_set_animation_range(self, params):
@@ -1671,6 +1686,7 @@ class KritaMCPExtension(Extension):
         doc.setActiveNode(node)
         if not node.animated():
             node.enableAnimation()
+            QApplication.processEvents()
 
         # Confirmed live against Krita 5.3.2.1's actual action text — "Create Blank Frame",
         # not the guessed "New Blank Frame". "Insert Keyframe Left/Right" is the fallback.
@@ -1679,10 +1695,11 @@ class KritaMCPExtension(Extension):
         original_time = doc.currentTime()
         results = []
         for frame in frames:
-            doc.setCurrentTime(frame)
+            self.set_current_time_sync(doc, frame)
             had_keyframe = node.hasKeyframeAtTime(frame)
             if not had_keyframe and blank_frame_action:
                 blank_frame_action.trigger()
+                QApplication.processEvents()
             shapes = node.addShapesFromSvg(svg)
             doc.refreshProjection()
             results.append({
@@ -1692,7 +1709,7 @@ class KritaMCPExtension(Extension):
                 "shapes_added": len(shapes),
             })
 
-        doc.setCurrentTime(original_time)
+        self.set_current_time_sync(doc, original_time)
         doc.refreshProjection()
         return {
             "status": "ok",

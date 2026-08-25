@@ -119,6 +119,20 @@ trigger, not a guaranteed API contract — don't assume it silently works on a n
 without checking that field. `list_actions(filter="frame"|"keyframe")` is how the real name was
 found; re-run it before trusting `find_action`'s keyword list on a different Krita version.
 
+**`Document.setCurrentTime()` is asynchronous.** Confirmed live: `doc.setCurrentTime(5)` followed
+immediately by `doc.currentTime()` *in the same command handler* returned `0`, while a later,
+separate command correctly saw `5` — Krita's internal frame-changed signal fires on a queued
+connection, not synchronously. This silently broke the first version of
+`cmd_stamp_vector_on_frames`: `setCurrentTime(frame)` then immediately calling
+`hasKeyframeAtTime`/`addShapesFromSvg`/triggering the blank-frame action all executed against the
+frame Krita hadn't actually switched to yet, so every "stamped" shape landed on frame 0's shared
+vector state instead of the intended frame. Fixed by `set_current_time_sync()`, which calls
+`QApplication.processEvents()` right after `setCurrentTime()` to force queued handlers to run
+before returning. **Any new command that calls `setCurrentTime()` and then immediately reads or
+acts on "the current frame" must go through `set_current_time_sync()`, not call it directly** —
+same for triggering a QAction that itself schedules async work (the blank-frame action also gets a
+`processEvents()` pump before its effect is trusted).
+
 ## Known API quirks
 
 - **`QByteArray` indexing returns `bytes`, not `int`, on this PyQt5/sip build.** Any code that
