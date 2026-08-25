@@ -138,6 +138,17 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 `krita-shading-technique` (a Claude Code skill, see `plugins/krita/skills/` in the AIHelpers hub)
 covers building fur/latex brush presets and structuring a shading layer stack with these tools.
 
+**Animation**
+
+| Tool | Description |
+|------|-------------|
+| `krita_animation_info` | Current frame, length, fps, clip range, and a layer's animation state |
+| `krita_set_current_time` | Move the animation playhead to a frame |
+| `krita_set_animation_range` | Set the document's start/end frame |
+| `krita_enable_layer_animation` | Turn on keyframe support for a layer |
+| `krita_stamp_vector_on_frames` | Add the same SVG shape(s) as a keyframe across multiple frames on a vector layer |
+| `krita_list_actions` | List Krita menu/toolbar action names by filter (debugging aid) |
+
 ### Native menu actions (no AI/MCP required)
 
 The plugin also registers two plain Krita menu actions (Tools → Scripts), usable without Claude or

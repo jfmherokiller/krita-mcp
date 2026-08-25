@@ -853,5 +853,105 @@ def krita_list_shapes(layer: Optional[str] = None) -> str:
     )
 
 
+# --- Animation ---
+
+@mcp.tool()
+def krita_animation_info(layer: Optional[str] = None) -> str:
+    """Report animation timing for the active document (current frame, length, fps, clip range) and, optionally, a layer's animation state."""
+    result = send_command("animation_info", {"layer": layer} if layer else {})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    lines = [
+        f"Frame {result.get('currentTime')} / {result.get('animationLength')} @ {result.get('framesPerSecond')}fps",
+        f"Clip range: {result.get('fullClipRangeStart')}-{result.get('fullClipRangeEnd')}",
+    ]
+    if "layer" in result:
+        lines.append(
+            f"Layer '{result['layer']}': animated={result.get('layerAnimated')}, "
+            f"keyframe at current time={result.get('layerHasKeyframeAtCurrentTime')}"
+        )
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def krita_set_current_time(time: int) -> str:
+    """Move the animation playhead to a specific frame."""
+    result = send_command("set_current_time", {"time": time})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Playhead at frame {result.get('currentTime')}"
+
+
+@mcp.tool()
+def krita_set_animation_range(start: int, end: int) -> str:
+    """Set the document's full clip range (the animation's start/end frame)."""
+    result = send_command("set_animation_range", {"start": start, "end": end})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Animation range set to {start}-{end}"
+
+
+@mcp.tool()
+def krita_enable_layer_animation(name: Optional[str] = None) -> str:
+    """Enable animation (keyframe support) on a layer (default: active layer)."""
+    result = send_command("enable_layer_animation", {"name": name} if name else {})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Layer '{result.get('name')}' animated={result.get('animated')}"
+
+
+@mcp.tool()
+def krita_list_actions(filter: str = "") -> str:
+    """List registered Krita menu/toolbar action names matching a filter (debugging aid — e.g. to find the exact name of a timeline action)."""
+    result = send_command("list_actions", {"filter": filter})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    actions = result.get("actions", [])
+    if not actions:
+        return "No matching actions"
+    return f"Matching actions ({len(actions)}):\n" + "\n".join(f"  - {a}" for a in actions)
+
+
+@mcp.tool()
+def krita_stamp_vector_on_frames(svg: str, frames: list[int], layer: Optional[str] = None) -> str:
+    """
+    Add the same SVG shape(s) as a keyframe on a vector layer at each of several animation frames
+    — e.g. stamping a prop, watermark, or guide shape identically across multiple frames instead
+    of hand-copying it. The layer must be a vector layer (krita_create_layer with type="vector").
+
+    Keyframe creation is done by triggering Krita's own New Blank Frame/New Keyframe action where
+    no keyframe exists yet (there's no direct scripting call for that) — check the per-frame
+    has_keyframe_after result and verify visually before relying on this across many frames.
+
+    Args:
+        svg: SVG markup to stamp (a <svg>...</svg> document, or a shape fragment)
+        frames: List of frame numbers to stamp onto
+        layer: Vector layer name (default: active layer)
+    """
+    if len(frames) > 200:
+        return f"Error: Too many frames ({len(frames)}), cap is 200 per call"
+
+    params = {"svg": svg, "frames": frames}
+    if layer:
+        params["layer"] = layer
+    result = send_command("stamp_vector_on_frames", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    per_frame = result.get("frames", [])
+    lines = [f"Stamped onto layer '{result.get('layer')}' (action used: {result.get('used_action')})"]
+    for f in per_frame:
+        flag = "OK" if f["has_keyframe_after"] else "NO KEYFRAME — check manually"
+        lines.append(f"  - frame {f['frame']}: {f['shapes_added']} shape(s), {flag}")
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     mcp.run()

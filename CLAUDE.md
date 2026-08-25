@@ -105,6 +105,18 @@ before being rewritten to build a `QImage` from `node.pixelData()` and save via 
 read pixels yourself and save via `QImage`/Qt — over `Node.save()` for any new single-node export
 command; don't assume `setBatchmode` protects a command just because it worked for `get_canvas`.
 
+## Animation / keyframes
+
+There is no direct scripting call to create a keyframe — `Node` has `animated()`,
+`enableAnimation()`, and `hasKeyframeAtTime(frame)`, but nothing like `addKeyframe(frame)`. The
+only way to insert one is Krita's own timeline QAction (New Blank Frame / New Keyframe), found at
+runtime by matching action *text* rather than a hardcoded id (`find_action()` — text can drift
+across Krita versions/locales; the action-trigger pattern itself was already proven safe by
+`cmd_undo`/`cmd_redo` triggering `app.action('edit_undo'/'edit_redo')`). `cmd_stamp_vector_on_frames`
+uses this and reports `has_keyframe_after` per frame precisely because the mechanism is a text-match
+UI-action trigger, not a guaranteed API contract — don't assume it silently works on a new Krita
+version without checking that field.
+
 ## Known API quirks
 
 - **`QByteArray` indexing returns `bytes`, not `int`, on this PyQt5/sip build.** Any code that

@@ -99,7 +99,9 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
                     "list_documents", "close_document", "resize_canvas", "crop_canvas",
                     "flatten_image", "export_layer",
                     "stroke_native", "flood_fill", "set_layer_clipping",
-                    "add_svg_shapes", "export_layer_svg", "list_shapes"
+                    "add_svg_shapes", "export_layer_svg", "list_shapes",
+                    "animation_info", "set_current_time", "set_animation_range",
+                    "enable_layer_animation", "list_actions", "stamp_vector_on_frames"
                 ]
             })
         else:
@@ -332,6 +334,18 @@ class KritaMCPExtension(Extension):
                 return self.cmd_export_layer_svg(params)
             elif action == "list_shapes":
                 return self.cmd_list_shapes(params)
+            elif action == "animation_info":
+                return self.cmd_animation_info(params)
+            elif action == "set_current_time":
+                return self.cmd_set_current_time(params)
+            elif action == "set_animation_range":
+                return self.cmd_set_animation_range(params)
+            elif action == "enable_layer_animation":
+                return self.cmd_enable_layer_animation(params)
+            elif action == "list_actions":
+                return self.cmd_list_actions(params)
+            elif action == "stamp_vector_on_frames":
+                return self.cmd_stamp_vector_on_frames(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -372,6 +386,21 @@ class KritaMCPExtension(Extension):
     def find_node(self, doc, name):
         """Find a node by name anywhere in the layer tree, or None."""
         return doc.nodeByName(name)
+
+    def find_action(self, *keywords):
+        """Find a registered QAction whose text contains all given keywords (case-insensitive).
+
+        Krita's Python API has no direct 'insert a keyframe' method on Node — the timeline's
+        New Keyframe/New Blank Frame/etc. only exist as QActions. Matching by keyword instead of
+        a hardcoded action id survives Krita renaming/relocalizing them across versions. The
+        action()/actions()-based trigger pattern itself is already proven in this file (cmd_undo,
+        cmd_redo use app.action('edit_undo'/'edit_redo').trigger()).
+        """
+        for action in Krita.instance().actions():
+            text = (action.text() or "").lower()
+            if all(k.lower() in text for k in keywords):
+                return action
+        return None
 
     def cmd_new_canvas(self, params):
         """Create a new canvas."""
@@ -1540,6 +1569,134 @@ class KritaMCPExtension(Extension):
                 }
                 for s in shapes
             ],
+        }
+
+    # --- Animation ---
+
+    def cmd_animation_info(self, params):
+        """Report animation timing for the active document and (optionally) a specific layer."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        info = {
+            "status": "ok",
+            "currentTime": doc.currentTime(),
+            "animationLength": doc.animationLength(),
+            "framesPerSecond": doc.framesPerSecond(),
+            "fullClipRangeStart": doc.fullClipRangeStartTime(),
+            "fullClipRangeEnd": doc.fullClipRangeEndTime(),
+        }
+        layer_name = params.get("layer")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if node:
+            info["layer"] = node.name()
+            info["layerAnimated"] = node.animated()
+            info["layerHasKeyframeAtCurrentTime"] = node.hasKeyframeAtTime(doc.currentTime())
+        return info
+
+    def cmd_set_current_time(self, params):
+        """Move the animation playhead to a specific frame."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        time = params.get("time")
+        if time is None:
+            return {"error": "time is required"}
+        doc.setCurrentTime(time)
+        return {"status": "ok", "currentTime": doc.currentTime()}
+
+    def cmd_set_animation_range(self, params):
+        """Set the document's full clip range (the animation's start/end frame)."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        start = params.get("start")
+        end = params.get("end")
+        if start is None or end is None:
+            return {"error": "start and end are required"}
+        doc.setFullClipRangeStartTime(start)
+        doc.setFullClipRangeEndTime(end)
+        return {"status": "ok", "start": start, "end": end}
+
+    def cmd_enable_layer_animation(self, params):
+        """Enable animation (keyframe support) on a layer."""
+        doc = self.get_active_document()
+        layer_name = params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        if not node.animated():
+            node.enableAnimation()
+        return {"status": "ok", "name": node.name(), "animated": node.animated()}
+
+    def cmd_list_actions(self, params):
+        """List registered Krita action names matching a filter (debugging aid for find_action)."""
+        filter_str = params.get("filter", "").lower()
+        names = [a.text() for a in Krita.instance().actions() if a.text() and filter_str in a.text().lower()]
+        return {"status": "ok", "actions": names}
+
+    def cmd_stamp_vector_on_frames(self, params):
+        """
+        Add the same SVG shape(s) as a new keyframe on a vector layer at each of several frames —
+        e.g. a watermark, a prop, or a guide shape that should appear identically at multiple
+        points in an animation without hand-copying it frame by frame.
+
+        The layer must be a vector layer (see create_layer type="vector"). Animation is enabled on
+        it automatically if not already. For each frame: if the layer has no keyframe there yet,
+        this tries to insert one via Krita's own New Blank Frame / New Keyframe action (found by
+        matching action text — there's no direct scripting call for this), THEN adds the SVG
+        shapes. Reports per-frame whether a keyframe actually ended up there, since keyframe
+        creation via a triggered UI action is less certain than a direct API call — check the
+        `frames` result and verify visually before relying on this for many frames.
+        """
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        svg = params.get("svg")
+        if not svg:
+            return {"error": "No svg content provided"}
+        frames = params.get("frames")
+        if not frames:
+            return {"error": "frames (a list of frame numbers) is required"}
+        if len(frames) > 200:
+            return {"error": f"Too many frames ({len(frames)}), cap is 200 per call"}
+
+        layer_name = params.get("layer")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        if node.type() != "vectorlayer":
+            return {"error": f"Layer '{node.name()}' is not a vector layer"}
+
+        doc.setActiveNode(node)
+        if not node.animated():
+            node.enableAnimation()
+
+        blank_frame_action = self.find_action("new", "blank", "frame") or self.find_action("new", "keyframe")
+
+        original_time = doc.currentTime()
+        results = []
+        for frame in frames:
+            doc.setCurrentTime(frame)
+            had_keyframe = node.hasKeyframeAtTime(frame)
+            if not had_keyframe and blank_frame_action:
+                blank_frame_action.trigger()
+            shapes = node.addShapesFromSvg(svg)
+            doc.refreshProjection()
+            results.append({
+                "frame": frame,
+                "had_keyframe_before": had_keyframe,
+                "has_keyframe_after": node.hasKeyframeAtTime(frame),
+                "shapes_added": len(shapes),
+            })
+
+        doc.setCurrentTime(original_time)
+        doc.refreshProjection()
+        return {
+            "status": "ok",
+            "layer": node.name(),
+            "used_action": blank_frame_action.text() if blank_frame_action else None,
+            "frames": results,
         }
 
 
