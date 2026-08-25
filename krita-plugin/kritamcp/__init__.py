@@ -391,7 +391,7 @@ class KritaMCPExtension(Extension):
         """Find a registered QAction whose text contains all given keywords (case-insensitive).
 
         Krita's Python API has no direct 'insert a keyframe' method on Node — the timeline's
-        New Keyframe/New Blank Frame/etc. only exist as QActions. Matching by keyword instead of
+        Create Blank Frame/Insert Keyframe/etc. only exist as QActions. Matching by keyword instead of
         a hardcoded action id survives Krita renaming/relocalizing them across versions. The
         action()/actions()-based trigger pattern itself is already proven in this file (cmd_undo,
         cmd_redo use app.action('edit_undo'/'edit_redo').trigger()).
@@ -1643,7 +1643,7 @@ class KritaMCPExtension(Extension):
 
         The layer must be a vector layer (see create_layer type="vector"). Animation is enabled on
         it automatically if not already. For each frame: if the layer has no keyframe there yet,
-        this tries to insert one via Krita's own New Blank Frame / New Keyframe action (found by
+        this tries to insert one via Krita's own Create Blank Frame / Insert Keyframe action (found by
         matching action text — there's no direct scripting call for this), THEN adds the SVG
         shapes. Reports per-frame whether a keyframe actually ended up there, since keyframe
         creation via a triggered UI action is less certain than a direct API call — check the
@@ -1672,7 +1672,9 @@ class KritaMCPExtension(Extension):
         if not node.animated():
             node.enableAnimation()
 
-        blank_frame_action = self.find_action("new", "blank", "frame") or self.find_action("new", "keyframe")
+        # Confirmed live against Krita 5.3.2.1's actual action text — "Create Blank Frame",
+        # not the guessed "New Blank Frame". "Insert Keyframe Left/Right" is the fallback.
+        blank_frame_action = self.find_action("blank", "frame") or self.find_action("insert", "keyframe")
 
         original_time = doc.currentTime()
         results = []

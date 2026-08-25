@@ -925,7 +925,7 @@ def krita_stamp_vector_on_frames(svg: str, frames: list[int], layer: Optional[st
     — e.g. stamping a prop, watermark, or guide shape identically across multiple frames instead
     of hand-copying it. The layer must be a vector layer (krita_create_layer with type="vector").
 
-    Keyframe creation is done by triggering Krita's own New Blank Frame/New Keyframe action where
+    Keyframe creation is done by triggering Krita's own Create Blank Frame/Insert Keyframe action where
     no keyframe exists yet (there's no direct scripting call for that) — check the per-frame
     has_keyframe_after result and verify visually before relying on this across many frames.
 

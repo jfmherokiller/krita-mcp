@@ -109,13 +109,15 @@ command; don't assume `setBatchmode` protects a command just because it worked f
 
 There is no direct scripting call to create a keyframe — `Node` has `animated()`,
 `enableAnimation()`, and `hasKeyframeAtTime(frame)`, but nothing like `addKeyframe(frame)`. The
-only way to insert one is Krita's own timeline QAction (New Blank Frame / New Keyframe), found at
-runtime by matching action *text* rather than a hardcoded id (`find_action()` — text can drift
-across Krita versions/locales; the action-trigger pattern itself was already proven safe by
+only way to insert one is Krita's own timeline QAction (**"Create Blank Frame"**, confirmed live
+against Krita 5.3.2.1 — the initially-guessed "New Blank Frame" doesn't exist and matched nothing),
+found at runtime by matching action *text* rather than a hardcoded id (`find_action()` — text can
+drift across Krita versions/locales; the action-trigger pattern itself was already proven safe by
 `cmd_undo`/`cmd_redo` triggering `app.action('edit_undo'/'edit_redo')`). `cmd_stamp_vector_on_frames`
-uses this and reports `has_keyframe_after` per frame precisely because the mechanism is a text-match
-UI-action trigger, not a guaranteed API contract — don't assume it silently works on a new Krita
-version without checking that field.
+reports `has_keyframe_after` per frame precisely because the mechanism is a text-match UI-action
+trigger, not a guaranteed API contract — don't assume it silently works on a new Krita version
+without checking that field. `list_actions(filter="frame"|"keyframe")` is how the real name was
+found; re-run it before trusting `find_action`'s keyword list on a different Krita version.
 
 ## Known API quirks
 
