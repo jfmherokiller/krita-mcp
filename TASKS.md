@@ -55,34 +55,23 @@ has no `.git`, only `mcp-servers/krita-mcp` does).
 
 ## In progress / needs retest
 
-- **`stamp_vector_on_frames`** — the user's original ask ("stamp a vector on multiple frames").
-  **Confirmed broken, twice, two different root causes, still unresolved.**
-  1. First attempt: all shapes landed on frame 0's shared vector content. Diagnosed as
-     `Document.setCurrentTime()` being asynchronous (confirmed live — immediate read-back in the
-     same command handler returned the stale time). Fixed via `set_current_time_sync()`.
-  2. Retested live after that fix, in a fresh test vector layer, same `voreanim.kra` document:
-     **identical symptom** — all 3 stamped circles still landed on frame 0's shared content,
-     `has_keyframe_after` still `False` for every target frame. So the timing fix was necessary but
-     not sufficient; something else is also wrong.
-  - Current best hypothesis (unverified): the "Create Blank Frame" QAction likely reads the
-    Timeline docker widget's own internal UI selection (which layer/frame cell is highlighted in
-    that specific widget), not `doc.activeNode()`/`doc.currentTime()` — and nothing in the scripting
-    API exposes that widget's selection model, so the action probably silently no-ops when
-    triggered from a script regardless of timing. Not confirmed against Krita source or further
-    experiments; ran out of restart-cycle budget on the user's real animation file for this session.
-  - **Recommended next step:** stop trying to drive the Timeline docker via `find_action()` and
-    switch to a **raster-layer stamp** instead — rasterize the SVG once (Qt can render SVG to a
-    `QImage` via `QSvgRenderer`), then `setPixelData()` it onto a **paint** layer's keyframes at
-    each target frame. Raster keyframing is proven reliable (`Paint Layer 1` in this same file has
-    a real, correctly-detected keyframe at frame 0 in every test). This loses per-frame vector
-    editability (it becomes a rasterized stamp, not an editable path) but actually delivers "the
-    same shape appears identically at multiple frames," which was the real goal. Needs the user's
-    explicit buy-in before switching since it changes what the tool delivers vs. what was literally
-    asked ("stamp a *vector*").
-  - Untried alternative if true vector-per-frame content still matters enough to chase further:
-    inspect Krita's C++ source (`libs/ui/kis_animation_...` / `KisShapeLayer` keyframing) to find
-    whether there's an internal, non-QAction way to add a vector keyframe — likely a multi-hour
-    detour, only worth it if the raster fallback is rejected.
+- **`stamp_on_frames`** (was `stamp_vector_on_frames`) — the user's original ask ("stamp a vector
+  on multiple frames"). True vector-layer keyframing confirmed broken, twice, independent of an
+  async-timing bug that was also real and fixed along the way (see CLAUDE.md "Animation /
+  keyframes" for both). **User chose (2026-08-26) to switch to the raster approach** rather than
+  keep chasing true vector keyframes. Rewritten: rasterizes the SVG once via `QSvgRenderer`/
+  `QPainter` into a `QImage`, then alpha-blends those pixels onto a **paint** layer's keyframes at
+  each target frame via `setPixelData()`. Old vector-based action/tool names removed entirely
+  (`stamp_vector_on_frames` → `stamp_on_frames`, now takes `x`/`y` placement params, requires a
+  paint layer not a vector layer). **Not yet tested live** — written but the plugin hasn't been
+  reloaded/retested since this rewrite. Next step when resuming: restart Krita, create a throwaway
+  paint layer in `voreanim.kra`, call `stamp_on_frames` on 2-3 frames, check `has_keyframe_after`
+  is `True` for each, and verify with `get_color_at` (or export + visual check) at different
+  `set_current_time` values that the stamp only appears on the target frames, not everywhere.
+- Untried alternative if true vector-per-frame content ever matters enough to revisit: inspect
+  Krita's C++ source (`libs/ui/kis_animation_...` / `KisShapeLayer` keyframing) to find whether
+  there's an internal, non-QAction way to add a vector keyframe. Explicitly deprioritized in favor
+  of the raster approach for now.
 
 ## Known limitations / open questions
 

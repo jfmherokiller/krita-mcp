@@ -113,20 +113,29 @@ only way to insert one is Krita's own timeline QAction (**"Create Blank Frame"**
 against Krita 5.3.2.1 — the initially-guessed "New Blank Frame" doesn't exist and matched nothing),
 found at runtime by matching action *text* rather than a hardcoded id (`find_action()` — text can
 drift across Krita versions/locales; the action-trigger pattern itself was already proven safe by
-`cmd_undo`/`cmd_redo` triggering `app.action('edit_undo'/'edit_redo')`). `cmd_stamp_vector_on_frames`
+`cmd_undo`/`cmd_redo` triggering `app.action('edit_undo'/'edit_redo')`). `cmd_stamp_on_frames`
 reports `has_keyframe_after` per frame precisely because the mechanism is a text-match UI-action
 trigger, not a guaranteed API contract — don't assume it silently works on a new Krita version
 without checking that field. `list_actions(filter="frame"|"keyframe")` is how the real name was
 found; re-run it before trusting `find_action`'s keyword list on a different Krita version.
 
+**Vector-layer keyframing via scripting does not work, confirmed live, twice.** The original
+`cmd_stamp_vector_on_frames` used `Node.addShapesFromSvg()` after `setCurrentTime(frame)` +
+triggering Create Blank Frame — every stamped shape landed on frame 0's shared vector content
+regardless of the target frame, and `hasKeyframeAtTime()` stayed `False` even at frame 0 despite
+`enableAnimation()` reporting `animated=True`. This reproduced identically after fixing the
+`setCurrentTime()` timing bug below, ruling that out as the sole cause. Best-guess explanation
+(unconfirmed against Krita's source): Create Blank Frame likely reads the Timeline docker widget's
+own UI selection state, which nothing in the scripting API can drive. **Don't build another
+vector-per-frame-keyframe feature on this API without solving that first** — `cmd_stamp_on_frames`
+was rewritten to rasterize the SVG via `QSvgRenderer`/`QPainter` and paint pixels onto a **paint**
+layer's keyframes instead, since raster keyframing (verified against `hasKeyframeAtTime` on a real
+animation's existing paint layer) works correctly.
+
 **`Document.setCurrentTime()` is asynchronous.** Confirmed live: `doc.setCurrentTime(5)` followed
 immediately by `doc.currentTime()` *in the same command handler* returned `0`, while a later,
 separate command correctly saw `5` — Krita's internal frame-changed signal fires on a queued
-connection, not synchronously. This silently broke the first version of
-`cmd_stamp_vector_on_frames`: `setCurrentTime(frame)` then immediately calling
-`hasKeyframeAtTime`/`addShapesFromSvg`/triggering the blank-frame action all executed against the
-frame Krita hadn't actually switched to yet, so every "stamped" shape landed on frame 0's shared
-vector state instead of the intended frame. Fixed by `set_current_time_sync()`, which calls
+connection, not synchronously. Fixed by `set_current_time_sync()`, which calls
 `QApplication.processEvents()` right after `setCurrentTime()` to force queued handlers to run
 before returning. **Any new command that calls `setCurrentTime()` and then immediately reads or
 acts on "the current frame" must go through `set_current_time_sync()`, not call it directly** —

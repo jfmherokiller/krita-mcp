@@ -919,28 +919,41 @@ def krita_list_actions(filter: str = "") -> str:
 
 
 @mcp.tool()
-def krita_stamp_vector_on_frames(svg: str, frames: list[int], layer: Optional[str] = None) -> str:
+def krita_stamp_on_frames(
+    svg: str,
+    frames: list[int],
+    x: int = 0,
+    y: int = 0,
+    layer: Optional[str] = None,
+) -> str:
     """
-    Add the same SVG shape(s) as a keyframe on a vector layer at each of several animation frames
-    — e.g. stamping a prop, watermark, or guide shape identically across multiple frames instead
-    of hand-copying it. The layer must be a vector layer (krita_create_layer with type="vector").
+    Rasterize an SVG and paint it as pixels onto a paint layer's keyframes across multiple
+    animation frames — e.g. stamping a prop, watermark, or guide shape identically at multiple
+    points without hand-copying it. The layer must be a paint layer.
 
-    Keyframe creation is done by triggering Krita's own Create Blank Frame/Insert Keyframe action where
-    no keyframe exists yet (there's no direct scripting call for that) — check the per-frame
+    This paints a flattened raster stamp per frame, NOT an editable vector path — true per-frame
+    vector-layer keyframing was tried and confirmed broken (shapes always landed on frame 0's
+    shared vector content regardless of timing fixes; best guess is Krita's blank-frame action
+    reads Timeline docker UI state the scripting API can't drive). Raster keyframing is proven
+    reliable, so this rasterizes once and stamps pixels instead.
+
+    Keyframe creation is done by triggering Krita's own Create Blank Frame/Insert Keyframe action
+    where no keyframe exists yet (there's no direct scripting call for that) — check the per-frame
     has_keyframe_after result and verify visually before relying on this across many frames.
 
     Args:
-        svg: SVG markup to stamp (a <svg>...</svg> document, or a shape fragment)
+        svg: SVG markup to stamp (must have width/height on the root <svg> element)
         frames: List of frame numbers to stamp onto
-        layer: Vector layer name (default: active layer)
+        x, y: Top-left position on the canvas to stamp at
+        layer: Paint layer name (default: active layer)
     """
     if len(frames) > 200:
         return f"Error: Too many frames ({len(frames)}), cap is 200 per call"
 
-    params = {"svg": svg, "frames": frames}
+    params = {"svg": svg, "frames": frames, "x": x, "y": y}
     if layer:
         params["layer"] = layer
-    result = send_command("stamp_vector_on_frames", params, timeout=60.0)
+    result = send_command("stamp_on_frames", params, timeout=60.0)
 
     if "error" in result:
         return f"Error: {result['error']}"
@@ -949,7 +962,7 @@ def krita_stamp_vector_on_frames(svg: str, frames: list[int], layer: Optional[st
     lines = [f"Stamped onto layer '{result.get('layer')}' (action used: {result.get('used_action')})"]
     for f in per_frame:
         flag = "OK" if f["has_keyframe_after"] else "NO KEYFRAME — check manually"
-        lines.append(f"  - frame {f['frame']}: {f['shapes_added']} shape(s), {flag}")
+        lines.append(f"  - frame {f['frame']}: {flag}")
     return "\n".join(lines)
 
 

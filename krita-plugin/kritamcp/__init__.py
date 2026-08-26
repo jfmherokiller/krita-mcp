@@ -4,8 +4,9 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF
-from PyQt5.QtGui import QColor, QImage
+from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF, QByteArray
+from PyQt5.QtGui import QColor, QImage, QPainter
+from PyQt5.QtSvg import QSvgRenderer
 from PyQt5.QtWidgets import QMessageBox, QApplication
 import json
 import threading
@@ -101,7 +102,7 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
                     "stroke_native", "flood_fill", "set_layer_clipping",
                     "add_svg_shapes", "export_layer_svg", "list_shapes",
                     "animation_info", "set_current_time", "set_animation_range",
-                    "enable_layer_animation", "list_actions", "stamp_vector_on_frames"
+                    "enable_layer_animation", "list_actions", "stamp_on_frames"
                 ]
             })
         else:
@@ -344,8 +345,8 @@ class KritaMCPExtension(Extension):
                 return self.cmd_enable_layer_animation(params)
             elif action == "list_actions":
                 return self.cmd_list_actions(params)
-            elif action == "stamp_vector_on_frames":
-                return self.cmd_stamp_vector_on_frames(params)
+            elif action == "stamp_on_frames":
+                return self.cmd_stamp_on_frames(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -1650,19 +1651,25 @@ class KritaMCPExtension(Extension):
         names = [a.text() for a in Krita.instance().actions() if a.text() and filter_str in a.text().lower()]
         return {"status": "ok", "actions": names}
 
-    def cmd_stamp_vector_on_frames(self, params):
+    def cmd_stamp_on_frames(self, params):
         """
-        Add the same SVG shape(s) as a new keyframe on a vector layer at each of several frames —
-        e.g. a watermark, a prop, or a guide shape that should appear identically at multiple
-        points in an animation without hand-copying it frame by frame.
+        Rasterize an SVG and paint it as pixels onto a paint layer's keyframes across multiple
+        animation frames — e.g. a prop, watermark, or guide shape that should appear identically
+        at multiple points without hand-copying it frame by frame.
 
-        The layer must be a vector layer (see create_layer type="vector"). Animation is enabled on
+        This paints a flattened raster stamp per frame, NOT an editable vector path. True
+        per-frame vector-layer keyframing (adding real shapes via addShapesFromSvg at a specific
+        frame) was tried and confirmed broken twice, live, against a real animation: shapes always
+        landed on frame 0's shared vector content regardless of doc.setCurrentTime()/timing fixes.
+        Best-guess cause: Krita's Create Blank Frame action reads the Timeline docker widget's own
+        UI selection, which the scripting API can't drive — not confirmed further. Raster
+        keyframing is proven reliable (a real animation's own paint layer correctly reports
+        hasKeyframeAtTime in every test here), so this rasterizes once and stamps pixels instead.
+
+        The layer must be a paint layer (see create_layer type="paint"). Animation is enabled on
         it automatically if not already. For each frame: if the layer has no keyframe there yet,
-        this tries to insert one via Krita's own Create Blank Frame / Insert Keyframe action (found by
-        matching action text — there's no direct scripting call for this), THEN adds the SVG
-        shapes. Reports per-frame whether a keyframe actually ended up there, since keyframe
-        creation via a triggered UI action is less certain than a direct API call — check the
-        `frames` result and verify visually before relying on this for many frames.
+        creates one via Krita's Create Blank Frame action, then blits the rasterized SVG at (x, y),
+        alpha-blended over whatever's already there.
         """
         doc = self.get_active_document()
         if not doc:
@@ -1675,13 +1682,35 @@ class KritaMCPExtension(Extension):
             return {"error": "frames (a list of frame numbers) is required"}
         if len(frames) > 200:
             return {"error": f"Too many frames ({len(frames)}), cap is 200 per call"}
+        x, y = params.get("x", 0), params.get("y", 0)
 
         layer_name = params.get("layer")
         node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
         if not node:
             return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
-        if node.type() != "vectorlayer":
-            return {"error": f"Layer '{node.name()}' is not a vector layer"}
+        if node.type() != "paintlayer":
+            return {"error": f"Layer '{node.name()}' is not a paint layer"}
+
+        renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+        if not renderer.isValid():
+            return {"error": "Invalid SVG"}
+        size = renderer.defaultSize()
+        w, h = size.width(), size.height()
+        if w <= 0 or h <= 0:
+            return {"error": "SVG has no intrinsic size — include width/height on the <svg> root"}
+        if x < 0 or y < 0 or x + w > doc.width() or y + h > doc.height():
+            return {"error": f"Stamp at ({x},{y}) {w}x{h} doesn't fit within the {doc.width()}x{doc.height()} canvas"}
+
+        image = QImage(w, h, QImage.Format_ARGB32)
+        image.fill(0)
+        painter = QPainter(image)
+        renderer.render(painter)
+        painter.end()
+        # Format_ARGB32 is stored BGRA in memory on little-endian, matching this file's
+        # setPixelData convention throughout. bytesPerLine(), not width*4, in case Qt pads rows.
+        bits = image.bits()
+        bits.setsize(image.bytesPerLine() * h)
+        stamp_pixels = bytes(bits)
 
         doc.setActiveNode(node)
         if not node.animated():
@@ -1700,13 +1729,25 @@ class KritaMCPExtension(Extension):
             if not had_keyframe and blank_frame_action:
                 blank_frame_action.trigger()
                 QApplication.processEvents()
-            shapes = node.addShapesFromSvg(svg)
+
+            existing = bytearray(node.pixelData(x, y, w, h))
+            for i in range(w * h):
+                idx = i * 4
+                sa = stamp_pixels[idx + 3]
+                if sa == 0:
+                    continue
+                blend = sa / 255.0
+                existing[idx] = int(existing[idx] * (1 - blend) + stamp_pixels[idx] * blend)
+                existing[idx + 1] = int(existing[idx + 1] * (1 - blend) + stamp_pixels[idx + 1] * blend)
+                existing[idx + 2] = int(existing[idx + 2] * (1 - blend) + stamp_pixels[idx + 2] * blend)
+                existing[idx + 3] = max(existing[idx + 3], sa)
+            node.setPixelData(bytes(existing), x, y, w, h)
             doc.refreshProjection()
+
             results.append({
                 "frame": frame,
                 "had_keyframe_before": had_keyframe,
                 "has_keyframe_after": node.hasKeyframeAtTime(frame),
-                "shapes_added": len(shapes),
             })
 
         self.set_current_time_sync(doc, original_time)

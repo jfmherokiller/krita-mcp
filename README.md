@@ -146,7 +146,7 @@ covers building fur/latex brush presets and structuring a shading layer stack wi
 | `krita_set_current_time` | Move the animation playhead to a frame |
 | `krita_set_animation_range` | Set the document's start/end frame |
 | `krita_enable_layer_animation` | Turn on keyframe support for a layer |
-| `krita_stamp_vector_on_frames` | Add the same SVG shape(s) as a keyframe across multiple frames on a vector layer |
+| `krita_stamp_on_frames` | Rasterize an SVG and paint it onto a paint layer's keyframes across multiple frames (true vector-layer keyframing is unreliable via scripting — see CLAUDE.md) |
 | `krita_list_actions` | List Krita menu/toolbar action names by filter (debugging aid) |
 
 ### Native menu actions (no AI/MCP required)
