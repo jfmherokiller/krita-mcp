@@ -28,11 +28,33 @@ Copy the plugin files to your Krita plugins directory:
 | Linux | `~/.local/share/krita/pykrita/` |
 | macOS | `~/Library/Application Support/krita/pykrita/` |
 
+**These are the defaults — they do not depend on where Krita itself is installed, but they are
+not guaranteed either.** Krita keeps its resource location (where `pykrita/`, brush presets, etc.
+live) in its own config, separately from the install path, and that location can differ from the
+table above if you've set a custom resource folder (Settings → Manage Resources → *Open Resources
+Folder*) or are running a portable build. If the plugin doesn't show up after following the steps
+below, open that dialog first and copy the plugin files into the `pykrita/` folder it actually
+shows you, not the table above.
+
 Copy both:
 - `krita-plugin/kritamcp/` (the folder with `__init__.py`)
 - `krita-plugin/kritamcp.desktop`
 
 Then in Krita: **Settings → Configure Krita → Python Plugin Manager → Enable "Krita MCP Bridge"** and restart Krita.
+
+**Troubleshooting: plugin doesn't appear in the Python Plugin Manager list at all.** This means
+Krita never found the files — the HTTP bridge then never starts, so an MCP client can reach
+`server.py` (the stdio process) just fine while every tool call fails with "Cannot connect to
+Krita," which can look like a networking problem but isn't one. In order of likelihood:
+1. **Wrong resource folder** (see above) — the most common cause for portable/custom installs.
+   Verify via Settings → Manage Resources → *Open Resources Folder* and re-copy the files there.
+2. Both `kritamcp/` (the folder) and `kritamcp.desktop` (the file) need to be copied — a `.desktop`
+   file with no matching folder, or vice versa, won't register.
+3. Krita's Python scripting support itself needs to be available to have a Python Plugin Manager
+   at all — check Settings → Configure Krita → Python Plugin Manager exists and lists *any*
+   plugins (including Krita's own bundled ones) before troubleshooting further.
+4. A restart is required after enabling the plugin — Krita does not hot-reload plugin changes or
+   newly-enabled plugins into the current session.
 
 ### 2. Install the MCP Server
 
@@ -84,7 +106,8 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 
 | Tool | Description |
 |------|-------------|
-| `krita_list_layers` | List the layer tree (name, type, visibility, opacity, blending mode) |
+| `krita_list_layers` | List the layer tree (name, id, type, visibility, opacity, blending mode) — layer names aren't guaranteed unique, so tools that take a `name` also accept a layer's `id` |
+| `krita_find_nodes` | Search the layer tree by name/type/color-label — for pulling out specific layers/masks without parsing the full tree |
 | `krita_create_layer` | Create a paint/group/vector layer, optionally nested in a group |
 | `krita_delete_layer` | Remove a layer by name |
 | `krita_set_active_layer` | Make a layer the target for paint/fill/shape commands |
@@ -94,6 +117,7 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 | `krita_merge_layer_down` | Merge a layer into the one beneath it |
 | `krita_duplicate_layer` | Duplicate a layer |
 | `krita_reorder_layer` | Move a layer up/down in the stack |
+| `krita_scale_layer` / `krita_rotate_layer` / `krita_crop_layer` / `krita_shear_layer` | Resample/rotate/crop/shear a layer in place using Krita's real resampling filters |
 
 **Selections** — constrain `stroke`/`fill`/`draw_shape` to a region until cleared
 
@@ -121,9 +145,13 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 | `krita_set_color_space` | Convert color model/depth/profile (e.g. F16/F32 for HDR) |
 | `krita_list_color_profiles` | List valid profiles for a color model/depth |
 | `krita_list_documents` / `krita_close_document` | Manage open documents |
+| `krita_quit` | Cleanly quit Krita (closes documents without prompting to save) — for unattended/scripted restarts |
 | `krita_resize_canvas` / `krita_crop_canvas` | Resize or crop the canvas |
+| `krita_scale_canvas` / `krita_rotate_canvas` / `krita_shear_canvas` | Resample/rotate/shear the whole canvas using Krita's real resampling filters |
 | `krita_flatten_image` | Flatten all layers |
 | `krita_export_layer` | Export a single layer to an image file |
+| `krita_create_mask` | Non-destructive filter/transparency/selection mask on a layer (vs. `apply_filter`'s destructive bake-in) |
+| `krita_set_filter_mask_filter` | Swap an existing filter mask's filter/config in place |
 
 **Texture brushes, smart fill, clipping, vector**
 
@@ -134,6 +162,8 @@ MCP servers don't inherit a working directory, so `--project` must be an absolut
 | `krita_set_layer_clipping` | Clip a layer's paint to the layer beneath (standard shading technique) |
 | `krita_create_layer(type="fill", generator=...)` | Non-destructive fill layer (gradient/pattern/color) |
 | `krita_add_svg_shapes` / `krita_export_layer_svg` / `krita_list_shapes` | Import/export/inspect vector shapes on a vector layer |
+| `krita_create_colorize_mask` | Lazy-fill line art: mark regions with key-stroke colors, Krita segments and flat-fills them in one pass (better than `flood_fill` for line art) |
+| `krita_update_colorize_mask` | Repaint one key-stroke color's coverage on an existing colorize mask and re-run the fill |
 
 `krita-shading-technique` (a Claude Code skill, see `plugins/krita/skills/` in the AIHelpers hub)
 covers building fur/latex brush presets and structuring a shading layer stack with these tools.

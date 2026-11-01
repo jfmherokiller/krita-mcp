@@ -331,7 +331,12 @@ def krita_open_file(path: str) -> str:
 
 @mcp.tool()
 def krita_list_layers() -> str:
-    """List the layer tree of the active document (name, type, visibility, opacity, blending mode)."""
+    """
+    List the layer tree of the active document (name, id, type, visibility, opacity, blending
+    mode). Layer names are NOT guaranteed unique — if two layers share a name, pass the id shown
+    here (not the name) to any other tool's "name" parameter (create_layer, delete_layer,
+    set_active_layer, etc. all accept either) to target the exact one you mean.
+    """
     result = send_command("list_layers", {})
 
     if "error" in result:
@@ -343,7 +348,7 @@ def krita_list_layers() -> str:
             prefix = "  " * indent + "- "
             vis = "" if layer["visible"] else " (hidden)"
             lines.append(
-                f"{prefix}{layer['name']} [{layer['type']}] "
+                f"{prefix}{layer['name']} (id={layer['id']}) [{layer['type']}] "
                 f"opacity={layer['opacity']}/255 blend={layer['blendingMode']}{vis}"
             )
             lines.extend(format_layers(layer["children"], indent + 1))
@@ -352,6 +357,61 @@ def krita_list_layers() -> str:
     lines = format_layers(result.get("layers", []))
     if not lines:
         return "No layers"
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def krita_find_nodes(
+    name: str = "",
+    type: Optional[str] = None,
+    color_label: int = 0,
+    recursive: bool = True,
+    partial_match: bool = False,
+    under: Optional[str] = None,
+) -> str:
+    """
+    Search the layer tree for nodes matching name/type/color-label criteria — for pulling out
+    specific layers/masks in a large document without parsing list_layers' full tree dump.
+
+    Args:
+        name: Name to match (empty = match any name)
+        type: Node type to filter by, e.g. "paintlayer", "vectorlayer", "grouplayer",
+            "filllayer", "clonelayer", "filelayer", "filtermask", "transparencymask",
+            "selectionmask", "colorizemask", "transformmask" (omit for any type)
+        color_label: Krita's layer color-label index to filter by (omit/0 for any)
+        recursive: Search nested groups too (default True)
+        partial_match: Substring match instead of exact name match
+        under: Restrict the search to this layer/group's subtree (name or id) — default: the
+            whole document
+    """
+    params = {
+        "name": name, "recursive": recursive, "partial_match": partial_match,
+        "color_label": color_label,
+    }
+    if type:
+        params["type"] = type
+    if under:
+        params["under"] = under
+    result = send_command("find_nodes", params)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+
+    def format_layers(layers, indent=0):
+        lines = []
+        for layer in layers:
+            prefix = "  " * indent + "- "
+            vis = "" if layer["visible"] else " (hidden)"
+            lines.append(
+                f"{prefix}{layer['name']} (id={layer['id']}) [{layer['type']}] "
+                f"opacity={layer['opacity']}/255 blend={layer['blendingMode']}{vis}"
+            )
+            lines.extend(format_layers(layer["children"], indent + 1))
+        return lines
+
+    lines = format_layers(result.get("nodes", []))
+    if not lines:
+        return "No matching nodes"
     return "\n".join(lines)
 
 
@@ -367,9 +427,10 @@ def krita_create_layer(
     Create a new layer.
 
     Args:
-        name: Layer name
+        name: Layer name (not required to be unique — the returned id is the reliable way to
+            reference this exact layer later, e.g. in parent, or any other tool's "name" param)
         type: "paint", "group", "vector", or "fill" (a non-destructive generator layer)
-        parent: Name of an existing group layer to nest inside (default: top level)
+        parent: Name (or id) of an existing group layer to nest inside (default: top level)
         generator: Required when type="fill" — e.g. "gradient", "pattern", "color"
         config: Generator-specific config dict when type="fill" (keys vary by generator;
             omit for Krita's default). Fills the current selection, or the whole canvas if none.
@@ -385,12 +446,70 @@ def krita_create_layer(
 
     if "error" in result:
         return f"Error: {result['error']}"
-    return f"Created layer '{result.get('name')}' ({result.get('type')})"
+    return f"Created layer '{result.get('name')}' (id={result.get('id')}) ({result.get('type')})"
+
+
+@mcp.tool()
+def krita_create_mask(
+    type: str,
+    layer: Optional[str] = None,
+    name: str = "Mask",
+    filter: Optional[str] = None,
+    config: Optional[dict] = None,
+) -> str:
+    """
+    Create a non-destructive mask on a layer. Unlike apply_filter (which bakes pixels in
+    permanently), a mask stays live: a filter mask's effect can be swapped later via
+    set_filter_mask_filter, and any mask can be shown/hidden via set_layer_visible or removed via
+    delete_layer without touching the layer's actual pixels.
+
+    Args:
+        type: "filter" (apply a live, editable filter), "transparency" (mask out regions —
+            content stays but doesn't render/export), or "selection" (mask that IS a saved
+            selection, restorable later)
+        layer: Layer to attach the mask to (default: the active layer)
+        name: Name for the new mask
+        filter: Required when type="filter" — filter name (see list_filters)
+        config: Filter-specific config dict when type="filter" (keys vary by filter)
+    """
+    params = {"type": type, "name": name}
+    if layer:
+        params["layer"] = layer
+    if filter:
+        params["filter"] = filter
+    if config:
+        params["config"] = config
+    result = send_command("create_mask", params)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Created {result.get('type')} '{result.get('name')}' (id={result.get('id')})"
+
+
+@mcp.tool()
+def krita_set_filter_mask_filter(mask: str, filter: str, config: Optional[dict] = None) -> str:
+    """
+    Swap an existing filter mask's filter and/or config in place — re-edit the non-destructive
+    effect without deleting and recreating the mask.
+
+    Args:
+        mask: Name or id of the filter mask (see list_layers)
+        filter: New filter name (see list_filters)
+        config: Filter-specific config dict (keys vary by filter; omit to keep the filter's default)
+    """
+    params = {"mask": mask, "filter": filter}
+    if config:
+        params["config"] = config
+    result = send_command("set_filter_mask_filter", params)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Filter mask '{mask}' now using '{filter}'"
 
 
 @mcp.tool()
 def krita_delete_layer(name: str) -> str:
-    """Delete a layer by name."""
+    """Delete a layer by name, or by id (see list_layers) if the name might be ambiguous."""
     result = send_command("delete_layer", {"name": name})
 
     if "error" in result:
@@ -400,7 +519,8 @@ def krita_delete_layer(name: str) -> str:
 
 @mcp.tool()
 def krita_set_active_layer(name: str) -> str:
-    """Make a layer active — subsequent stroke/fill/draw_shape/clear commands target it."""
+    """Make a layer active (by name or id — see list_layers) — subsequent stroke/fill/draw_shape/
+    clear commands target it."""
     result = send_command("set_active_layer", {"name": name})
 
     if "error" in result:
@@ -462,12 +582,13 @@ def krita_merge_layer_down(name: str) -> str:
 
 @mcp.tool()
 def krita_duplicate_layer(name: str) -> str:
-    """Duplicate a layer, inserting the copy directly above the original."""
+    """Duplicate a layer (by name or id — see list_layers), inserting the copy directly above the
+    original."""
     result = send_command("duplicate_layer", {"name": name})
 
     if "error" in result:
         return f"Error: {result['error']}"
-    return f"Duplicated as '{result.get('name')}'"
+    return f"Duplicated as '{result.get('name')}' (id={result.get('id')})"
 
 
 @mcp.tool()
@@ -484,6 +605,85 @@ def krita_reorder_layer(name: str, direction: str) -> str:
     if "error" in result:
         return f"Error: {result['error']}"
     return f"Moved '{name}' {direction}"
+
+
+@mcp.tool()
+def krita_scale_layer(width: int, height: int, name: Optional[str] = None, strategy: str = "Bicubic") -> str:
+    """
+    Resample a layer to new pixel dimensions in place (top-left corner stays fixed). Uses Krita's
+    real resampling filters, not manual pixel math.
+
+    Args:
+        width, height: New size in pixels
+        name: Layer name or id (default: the active layer)
+        strategy: Resampling filter — "Bicubic" (default), "Bilinear", "Box", "Bell", "BSpline",
+            "Lanczos3", "Mitchell", "Hermite" (an unrecognized name silently falls back to Bicubic)
+    """
+    params = {"width": width, "height": height, "strategy": strategy}
+    if name:
+        params["name"] = name
+    result = send_command("scale_layer", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Scaled '{result.get('name')}' to {width}x{height}"
+
+
+@mcp.tool()
+def krita_rotate_layer(degrees: float, name: Optional[str] = None) -> str:
+    """
+    Rotate a layer in place around its own center.
+
+    Args:
+        degrees: Rotation angle in degrees (clockwise)
+        name: Layer name or id (default: the active layer)
+    """
+    params = {"degrees": degrees}
+    if name:
+        params["name"] = name
+    result = send_command("rotate_layer", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Rotated '{result.get('name')}' by {degrees} degrees"
+
+
+@mcp.tool()
+def krita_crop_layer(x: int, y: int, width: int, height: int, name: Optional[str] = None) -> str:
+    """
+    Crop a layer's content to a rectangle (in document coordinates).
+
+    Args:
+        x, y, width, height: Crop rectangle
+        name: Layer name or id (default: the active layer)
+    """
+    params = {"x": x, "y": y, "width": width, "height": height}
+    if name:
+        params["name"] = name
+    result = send_command("crop_layer", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Cropped '{result.get('name')}' to ({x}, {y}) {width}x{height}"
+
+
+@mcp.tool()
+def krita_shear_layer(angle_x: float = 0, angle_y: float = 0, name: Optional[str] = None) -> str:
+    """
+    Shear a layer in place.
+
+    Args:
+        angle_x, angle_y: Shear angle in degrees along each axis
+        name: Layer name or id (default: the active layer)
+    """
+    params = {"angle_x": angle_x, "angle_y": angle_y}
+    if name:
+        params["name"] = name
+    result = send_command("shear_layer", params, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Sheared '{result.get('name')}' ({angle_x}, {angle_y} degrees)"
 
 
 # --- Selections ---
@@ -672,6 +872,23 @@ def krita_close_document(name: Optional[str] = None) -> str:
 
 
 @mcp.tool()
+def krita_quit() -> str:
+    """
+    Cleanly quit Krita: closes every open document without prompting to save, then quits the
+    application. For unattended/scripted restarts (e.g. after a plugin-code change) — a raw
+    process kill can leave Krita treating the next launch as crash recovery, and a plain
+    close_document/window-close can still hit a "save changes?" prompt on some Krita builds with
+    no human there to dismiss it; this avoids both. The MCP connection will drop once Krita
+    exits — expect the next tool call to fail until the plugin's HTTP server is back up.
+    """
+    result = send_command("quit", {})
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return "Krita is quitting"
+
+
+@mcp.tool()
 def krita_resize_canvas(x: int, y: int, width: int, height: int) -> str:
     """
     Resize the canvas without scaling pixels (repositions the content origin).
@@ -695,6 +912,45 @@ def krita_crop_canvas(x: int, y: int, width: int, height: int) -> str:
     if "error" in result:
         return f"Error: {result['error']}"
     return f"Canvas cropped to {width}x{height} at ({x}, {y})"
+
+
+@mcp.tool()
+def krita_scale_canvas(width: int, height: int, strategy: str = "Bicubic") -> str:
+    """
+    Resample the whole canvas (all layers) to new pixel dimensions, preserving DPI. Uses Krita's
+    real resampling filters, not manual pixel math. Unlike resize_canvas (which just repositions
+    the content origin), this actually resamples pixels.
+
+    Args:
+        width, height: New size in pixels
+        strategy: Resampling filter — "Bicubic" (default), "Bilinear", "Box", "Bell", "BSpline",
+            "Lanczos3", "Mitchell", "Hermite" (an unrecognized name silently falls back to Bicubic)
+    """
+    result = send_command("scale_canvas", {"width": width, "height": height, "strategy": strategy}, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Canvas scaled to {width}x{height}"
+
+
+@mcp.tool()
+def krita_rotate_canvas(degrees: float) -> str:
+    """Rotate the whole canvas (all layers), resizing the canvas to fit. degrees: clockwise angle."""
+    result = send_command("rotate_canvas", {"degrees": degrees}, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Canvas rotated by {degrees} degrees"
+
+
+@mcp.tool()
+def krita_shear_canvas(angle_x: float = 0, angle_y: float = 0) -> str:
+    """Shear the whole canvas (all layers). angle_x/angle_y: shear angle in degrees along each axis."""
+    result = send_command("shear_canvas", {"angle_x": angle_x, "angle_y": angle_y}, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Canvas sheared ({angle_x}, {angle_y} degrees)"
 
 
 @mcp.tool()
@@ -964,6 +1220,72 @@ def krita_stamp_on_frames(
         flag = "OK" if f["has_keyframe_after"] else "NO KEYFRAME — check manually"
         lines.append(f"  - frame {f['frame']}: {flag}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def krita_create_colorize_mask(
+    key_strokes: list[dict],
+    layer: Optional[str] = None,
+    name: str = "Colorize Mask",
+    edge_detection: bool = False,
+    edge_detection_size: float = 4.0,
+    clean_up_amount: float = 0.0,
+    limit_to_device_bounds: bool = False,
+) -> str:
+    """
+    Create a Colorize Mask on a layer: mark regions of line art with "key stroke" colors and
+    Krita's own lazy-fill segmentation flat-fills every enclosed region in one pass. Better
+    suited to coloring line art than flood_fill — handles every region at once and tolerates
+    small gaps in the linework.
+
+    Args:
+        key_strokes: One entry per fill color:
+            {"color": "#rrggbb", "rects": [[x, y, w, h], ...], "transparent": bool}
+            "rects" mark axis-aligned boxes where that color's key stroke is painted — rough
+            scribble coverage, not an exact outline. Mark at most one entry "transparent": true
+            for a region (e.g. line-art background) that should stay unfilled.
+        layer: Paint layer to attach the mask to (default: the active layer)
+        name: Name for the new mask
+        edge_detection: Snap fill boundaries to nearby line art edges
+        edge_detection_size: Edge search radius in pixels (only applies if edge_detection)
+        clean_up_amount: 0-100, removes small stray fill regions
+        limit_to_device_bounds: Restrict segmentation to the layer's own pixel bounds
+    """
+    result = send_command("create_colorize_mask", {
+        "key_strokes": key_strokes,
+        "layer": layer,
+        "name": name,
+        "edge_detection": edge_detection,
+        "edge_detection_size": edge_detection_size,
+        "clean_up_amount": clean_up_amount,
+        "limit_to_device_bounds": limit_to_device_bounds,
+    }, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Created colorize mask '{result.get('name')}' with {result.get('key_stroke_count')} key strokes"
+
+
+@mcp.tool()
+def krita_update_colorize_mask(mask: str, color: str, rects: list[list[int]], update: bool = True) -> str:
+    """
+    Repaint one key-stroke color's coverage on an existing colorize mask (adds rects for that
+    color) and re-run the fill. The color must already be registered on this mask — i.e. it was
+    one of the key_strokes passed to krita_create_colorize_mask.
+
+    Args:
+        mask: Name of the colorize mask
+        color: Hex color of the key stroke to update — must match one used at creation
+        rects: [[x, y, w, h], ...] regions to mark with this color
+        update: Re-run the fill after writing (default True)
+    """
+    result = send_command("update_colorize_mask", {
+        "mask": mask, "color": color, "rects": rects, "update": update
+    }, timeout=60.0)
+
+    if "error" in result:
+        return f"Error: {result['error']}"
+    return f"Updated colorize mask '{mask}' key stroke '{color}'"
 
 
 if __name__ == "__main__":

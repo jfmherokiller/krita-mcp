@@ -68,10 +68,30 @@ themselves via `KritaMCPExtension.get_selection_mask()` and blending each pixel 
 selection's per-pixel alpha — see that method and its call sites before changing selection behavior
 or adding another pixel-writing command that should respect an active selection.
 
-`Node.name()` is not guaranteed unique — `find_node()`/`doc.nodeByName()` return the first match.
-Layer tools that take a `name` param (`set_active_layer`, `delete_layer`, `create_layer`'s `parent`,
-etc.) inherit this ambiguity; there's no by-ID lookup exposed yet (`Node.uniqueId()` exists in the
-Krita API but isn't threaded through).
+`Node.name()` is not guaranteed unique, but this is resolved: `find_node()` accepts either a name
+or a node's `uniqueId()` string (as returned in every node's `"id"` field — see `_node_info`,
+surfaced by `list_layers`/`create_layer`/`duplicate_layer`/`create_colorize_mask`) — `QUuid(name)`
+parses to a null UUID for anything that isn't a valid `{...}`-bracketed uuid string, including any
+real layer name, so passing a name still resolves exactly as before and passing an id disambiguates
+exactly. No tool signatures needed to change since every existing `name` param doubles as an id
+param this way. Confirmed live: two layers named identically, targeted individually by id,
+correctly affected only the intended one each time.
+
+`create_mask` (filter/transparency/selection) is the non-destructive counterpart to `apply_filter`
+— it attaches a `FilterMask`/`TransparencyMask`/`SelectionMask` as a child of the target layer
+(same attach pattern as `create_colorize_mask`: `target.addChildNode(mask, None)`), seeded from the
+active selection if one exists, else a full-canvas `Selection` (so a fresh mask starts fully "on").
+`set_filter_mask_filter` swaps an existing filter mask's `Filter`/config in place via
+`mask.setFilter(filt)` — this is the actual non-destructive-editing story; without it, `create_mask`
+alone would just be a fancier `apply_filter`. Toggling any mask's visibility (`set_layer_visible`,
+already generic across node types) or deleting it (`delete_layer`) leaves the underlying layer's
+pixels untouched — confirmed live by toggling a mask off and getting the pre-mask canvas back
+exactly. **While a document has an active selection, `list_layers` also surfaces a phantom
+top-level `Selection Mask` node** (its own id, sibling of the real layers, not nested under any of
+them) — this is Krita's own internal representation of the document's active/global selection, not
+something `create_mask` creates. It appears regardless of whether a selection mask was ever
+created via this API, and disappears once the selection is cleared. Don't parse it as a real node
+a caller made.
 
 ## Krita Python API reference
 
@@ -149,6 +169,59 @@ same for triggering a QAction that itself schedules async work (the blank-frame 
   wrap it in `bytearray(...)` first, or per-pixel math and `"{:02x}".format()`-style calls break.
   Bit `cmd_get_color_at` once (pre-existing bug, fixed by wrapping in `bytearray()`) — check any
   new raw pixel read for the same mistake.
+
+- **`ColorizeMask.setKeyStrokePixelData`/`keyStrokePixelData` use alpha8 (1 byte/pixel coverage),
+  not BGRA.** Every other pixel-writing command in this file (`setPixelData`/`pixelData` on a
+  regular `Node`) uses 4-byte BGRA pixels. Colorize masks store each key stroke's coverage in its
+  own internal alpha8 paint device — confirmed against Krita's `libs/libkis/ColorizeMask.cpp`
+  (`keyStroke.dev = new KisPaintDevice(KoColorSpaceRegistry::instance()->alpha8())`) and its own
+  test (`libs/libkis/tests/TestDocument.cpp::testCreateColorizeMask`), which
+  `cmd_create_colorize_mask`'s call order mirrors: create mask → parent under the target layer →
+  tune edge-detection/clean-up → `initializeKeyStrokeColors()` once with the full color list →
+  `setKeyStrokePixelData()` per color/region (plain `bytes([255]) * (w*h)` for full coverage) →
+  `updateMask()` → `setEditKeyStrokes(False)` → `setShowOutput(True)` → **`doc.waitForDone()`** →
+  `doc.refreshProjection()`. Calling `initializeKeyStrokeColors()` more than once on the same mask,
+  or calling `setKeyStrokePixelData()` before it, is not supported by the underlying C++.
+  **Confirmed live 2026-09-19** — line-art square outline, one key stroke inside (fills), one
+  outside marked `transparent` (stays empty): interior filled precisely to the line-art edge.
+
+- **`ColorizeMask.updateMask()` needs `doc.waitForDone()`, not `QApplication.processEvents()`, to
+  actually wait for its result.** The lazy-fill segmentation runs as an async job on Krita's own
+  image update scheduler — a completely different queue from Qt's event loop, so
+  `processEvents()` (the fix that works for the `setCurrentTime()` race above) does nothing for
+  it. First live test of `create_colorize_mask` produced no visible fill at all, no error from any
+  call — `updateMask()`/`setShowOutput(True)`/`refreshProjection()` all "succeeded" while the
+  segmentation hadn't actually finished yet. Root cause found by rereading
+  `libs/libkis/tests/TestDocument.cpp::testCreateColorizeMask` line-by-line: it calls
+  `d.waitForDone()` between `setShowOutput(true)` and `refreshProjection()` — a call this
+  implementation had skipped as apparent boilerplate despite the surrounding code otherwise
+  claiming to mirror that test exactly. Lesson for any future "confirmed against Krita's own test"
+  claim in this codebase: match literally every call in the reference, not just the ones that look
+  load-bearing.
+
+- **`Document.setBatchmode(True)` alone does not reliably suppress the "save changes?" prompt on
+  close, at least on Krita 6.0.3/Qt6.** `cmd_close_document` originally relied on it (matching the
+  precedent set by the export-timeout fix above); a live "Recover Files"-adjacent test still hit a
+  save-changes prompt with only that set. `doc.setModified(False)` before `.close()` is the actual
+  fix — it makes Krita's own dirty-check see nothing to save in the first place, rather than hoping
+  a UI-suppression flag also suppresses this particular prompt. `cmd_quit` (closes every open
+  document this way, then `QApplication.instance().quit()`) exists specifically for unattended
+  restarts, where no human is present to click either this prompt or the crash-recovery dialog a
+  raw process kill can trigger on the next launch (Krita's `checkAutosaveFiles()` in
+  `libs/ui/KisApplication.cpp` — a properly closed document doesn't leave an autosave file behind
+  to be offered for recovery).
+
+- **`Node.scaleNode/rotateNode/cropNode/shearNode` and `Document.scaleImage/rotateImage/shearImage`
+  are synchronous from Python's side** — confirmed against Krita's own `libs/libkis/Node.cpp` and
+  `Document.cpp`: each one already calls `image->waitForDone()` internally before returning. Unlike
+  `ColorizeMask.updateMask()` above, none of `cmd_scale_layer`/`cmd_rotate_layer`/`cmd_crop_layer`/
+  `cmd_shear_layer`/`cmd_scale_canvas`/`cmd_rotate_canvas`/`cmd_shear_canvas` need an extra
+  `doc.waitForDone()` of their own. `rotateNode`/`rotateImage` take radians (converted from the
+  degrees these tools accept at the Python layer); `shearNode`/`shearImage` take degrees natively —
+  confirmed via Krita's own comment "angleX, angleY are in degrees" in `libs/image/kis_image.cc`,
+  don't convert those. An unrecognized `strategy` name for `scaleNode`/`scaleImage` silently falls
+  back to `"Bicubic"` at the C++ level (`KisFilterStrategyRegistry`) rather than erroring — valid
+  names are `Bicubic`, `Bilinear`, `Box`, `Bell`, `BSpline`, `Lanczos3`, `Mitchell`, `Hermite`.
 
 ## Configuration
 

@@ -4,11 +4,30 @@ Allows Claude (or any MCP client) to paint by sending commands to this plugin.
 """
 
 from krita import *
-from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF, QByteArray
-from PyQt5.QtGui import QColor, QImage, QPainter
-from PyQt5.QtSvg import QSvgRenderer
-from PyQt5.QtWidgets import QMessageBox, QApplication
+import pykrita
+
+# Krita 5.x builds embed PyQt5; Krita 6.x builds embed PyQt6 and its own krita/__init__.py
+# actively raises ModuleNotFoundError if a script imports the "wrong" one (see
+# importAvoidWrongPyQtHack there) to avoid loading two conflicting copies of Qt. pykrita itself
+# (the C extension providing plugin-load hooks, already imported by krita/__init__.py before this
+# module runs) exposes qt_major_version() precisely so scripts can branch on this. PyQt6 also
+# requires fully-scoped enums (QImage.Format.Format_ARGB32, not QImage.Format_ARGB32) — the one
+# enum this file uses is aliased to QIMAGE_FORMAT_ARGB32 below so the rest of the file doesn't
+# need to branch on Qt version again.
+if pykrita.qt_major_version() == 6:
+    from PyQt6.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF, QByteArray, QUuid
+    from PyQt6.QtGui import QColor, QImage, QPainter
+    from PyQt6.QtSvg import QSvgRenderer
+    from PyQt6.QtWidgets import QMessageBox, QApplication
+    QIMAGE_FORMAT_ARGB32 = QImage.Format.Format_ARGB32
+else:
+    from PyQt5.QtCore import QTimer, QThread, pyqtSignal, QPoint, QPointF, QRectF, QByteArray, QUuid
+    from PyQt5.QtGui import QColor, QImage, QPainter
+    from PyQt5.QtSvg import QSvgRenderer
+    from PyQt5.QtWidgets import QMessageBox, QApplication
+    QIMAGE_FORMAT_ARGB32 = QImage.Format_ARGB32
 import json
+import math
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -90,19 +109,23 @@ class PaintRequestHandler(BaseHTTPRequestHandler):
                     "new_canvas", "set_color", "set_brush", "stroke",
                     "fill", "draw_shape", "get_canvas", "undo", "redo",
                     "clear", "save", "get_color_at", "list_brushes", "open_file",
-                    "list_layers", "create_layer", "delete_layer", "set_active_layer",
+                    "list_layers", "find_nodes", "create_layer", "create_mask",
+                    "set_filter_mask_filter", "delete_layer", "set_active_layer",
                     "set_layer_visible", "set_layer_opacity", "set_layer_blending_mode",
                     "merge_layer_down", "duplicate_layer", "reorder_layer",
+                    "scale_layer", "rotate_layer", "crop_layer", "shear_layer",
                     "select_rectangle", "select_all", "clear_selection", "invert_selection",
                     "grow_selection", "shrink_selection", "feather_selection",
                     "list_filters", "apply_filter",
                     "document_info", "set_color_space", "list_color_profiles",
-                    "list_documents", "close_document", "resize_canvas", "crop_canvas",
+                    "list_documents", "close_document", "quit", "resize_canvas", "crop_canvas",
+                    "scale_canvas", "rotate_canvas", "shear_canvas",
                     "flatten_image", "export_layer",
                     "stroke_native", "flood_fill", "set_layer_clipping",
                     "add_svg_shapes", "export_layer_svg", "list_shapes",
                     "animation_info", "set_current_time", "set_animation_range",
-                    "enable_layer_animation", "list_actions", "stamp_on_frames"
+                    "enable_layer_animation", "list_actions", "stamp_on_frames",
+                    "create_colorize_mask", "update_colorize_mask"
                 ]
             })
         else:
@@ -269,8 +292,14 @@ class KritaMCPExtension(Extension):
                 return self.cmd_open_file(params)
             elif action == "list_layers":
                 return self.cmd_list_layers(params)
+            elif action == "find_nodes":
+                return self.cmd_find_nodes(params)
             elif action == "create_layer":
                 return self.cmd_create_layer(params)
+            elif action == "create_mask":
+                return self.cmd_create_mask(params)
+            elif action == "set_filter_mask_filter":
+                return self.cmd_set_filter_mask_filter(params)
             elif action == "delete_layer":
                 return self.cmd_delete_layer(params)
             elif action == "set_active_layer":
@@ -287,6 +316,14 @@ class KritaMCPExtension(Extension):
                 return self.cmd_duplicate_layer(params)
             elif action == "reorder_layer":
                 return self.cmd_reorder_layer(params)
+            elif action == "scale_layer":
+                return self.cmd_scale_layer(params)
+            elif action == "rotate_layer":
+                return self.cmd_rotate_layer(params)
+            elif action == "crop_layer":
+                return self.cmd_crop_layer(params)
+            elif action == "shear_layer":
+                return self.cmd_shear_layer(params)
             elif action == "select_rectangle":
                 return self.cmd_select_rectangle(params)
             elif action == "select_all":
@@ -315,10 +352,18 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_documents(params)
             elif action == "close_document":
                 return self.cmd_close_document(params)
+            elif action == "quit":
+                return self.cmd_quit(params)
             elif action == "resize_canvas":
                 return self.cmd_resize_canvas(params)
             elif action == "crop_canvas":
                 return self.cmd_crop_canvas(params)
+            elif action == "scale_canvas":
+                return self.cmd_scale_canvas(params)
+            elif action == "rotate_canvas":
+                return self.cmd_rotate_canvas(params)
+            elif action == "shear_canvas":
+                return self.cmd_shear_canvas(params)
             elif action == "flatten_image":
                 return self.cmd_flatten_image(params)
             elif action == "export_layer":
@@ -347,6 +392,10 @@ class KritaMCPExtension(Extension):
                 return self.cmd_list_actions(params)
             elif action == "stamp_on_frames":
                 return self.cmd_stamp_on_frames(params)
+            elif action == "create_colorize_mask":
+                return self.cmd_create_colorize_mask(params)
+            elif action == "update_colorize_mask":
+                return self.cmd_update_colorize_mask(params)
             else:
                 return {"error": f"Unknown action: {action}"}
 
@@ -385,7 +434,19 @@ class KritaMCPExtension(Extension):
         return bytearray(selection.pixelData(x, y, w, h))
 
     def find_node(self, doc, name):
-        """Find a node by name anywhere in the layer tree, or None."""
+        """Find a node by name, or by unique ID, anywhere in the layer tree, or None.
+
+        Node.name() is not guaranteed unique -- doc.nodeByName() silently returns only the first
+        match. Every node's "id" field (see _node_info, returned by list_layers/create_layer/etc.)
+        is that node's real uniqueId(), which IS guaranteed unique; passing one of those id
+        strings back in here (any "name" param throughout this file doubles as an id param this
+        way, so no tool signatures needed to change) resolves the ambiguity exactly. QUuid(name)
+        parses to a null UUID for anything that isn't a valid "{...}"-bracketed uuid string --
+        including any normal layer name -- so this never misfires on a real name.
+        """
+        uid = QUuid(name) if name else QUuid()
+        if not uid.isNull():
+            return doc.nodeByUniqueID(uid)
         return doc.nodeByName(name)
 
     def find_action(self, *keywords):
@@ -1107,6 +1168,7 @@ class KritaMCPExtension(Extension):
     def _node_info(self, node):
         return {
             "name": node.name(),
+            "id": node.uniqueId().toString(),
             "type": node.type(),
             "visible": node.visible(),
             "opacity": node.opacity(),
@@ -1121,6 +1183,27 @@ class KritaMCPExtension(Extension):
             return {"error": "No active document"}
         root = doc.rootNode()
         return {"status": "ok", "layers": [self._node_info(c) for c in root.childNodes()]}
+
+    def cmd_find_nodes(self, params):
+        """
+        Search the layer tree for nodes matching name/type/color-label criteria — for pulling out
+        specific layers/masks in a large document without parsing list_layers' full tree dump.
+        Searches from the document root by default, or a subtree via "under" (name or id).
+        """
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        under_name = params.get("under")
+        root = self.find_node(doc, under_name) if under_name else doc.rootNode()
+        if not root:
+            return {"error": f"Layer not found: {under_name}"}
+        name = params.get("name", "")
+        recursive = params.get("recursive", True)
+        partial_match = params.get("partial_match", False)
+        node_type = params.get("type", "")
+        color_label = params.get("color_label", 0)
+        matches = root.findChildNodes(name, recursive, partial_match, node_type, color_label)
+        return {"status": "ok", "nodes": [self._node_info(n) for n in matches]}
 
     def cmd_create_layer(self, params):
         """Create a new layer (paint, group, or vector) under a parent (default: root)."""
@@ -1161,7 +1244,97 @@ class KritaMCPExtension(Extension):
 
         parent.addChildNode(node, None)
         doc.refreshProjection()
-        return {"status": "ok", "name": node.name(), "type": node.type()}
+        return {"status": "ok", "name": node.name(), "id": node.uniqueId().toString(), "type": node.type()}
+
+    def cmd_create_mask(self, params):
+        """
+        Create a non-destructive mask (filter/transparency/selection) on a layer.
+
+        Non-destructive alternative to apply_filter: a filter mask stays live and editable
+        (swap its filter/config, toggle its visibility, delete it) instead of baking pixels in.
+        Transparency/selection masks likewise carry a Selection as their content rather than
+        overwriting layer pixels. All three attach as a child of the target layer — same pattern
+        as create_colorize_mask — and use the current active selection as their initial masked
+        region if one exists, else the whole canvas (so a freshly created mask starts fully
+        "on" rather than blank).
+        """
+        mask_type = params.get("type")
+        if mask_type not in ("filter", "transparency", "selection"):
+            return {"error": "type must be 'filter', 'transparency', or 'selection'"}
+
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+
+        layer_name = params.get("layer")
+        target = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not target:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+
+        name = params.get("name", "Mask")
+        selection = doc.selection()
+        if selection is None:
+            selection = Selection()
+            selection.select(0, 0, doc.width(), doc.height(), 255)
+
+        if mask_type == "filter":
+            filter_name = params.get("filter")
+            if not filter_name:
+                return {"error": "type='filter' requires a 'filter' param (see list_filters)"}
+            filt = Krita.instance().filter(filter_name)
+            if not filt:
+                return {"error": f"Unknown filter: {filter_name}. See list_filters for valid names."}
+            config = params.get("config")
+            if config:
+                info = InfoObject()
+                info.setProperties(config)
+                filt.setConfiguration(info)
+            mask = doc.createFilterMask(name, filt, selection)
+        elif mask_type == "transparency":
+            mask = doc.createTransparencyMask(name)
+            if mask:
+                mask.setSelection(selection)
+        else:
+            mask = doc.createSelectionMask(name)
+            if mask:
+                mask.setSelection(selection)
+
+        if not mask:
+            return {"error": f"Failed to create {mask_type} mask"}
+
+        target.addChildNode(mask, None)
+        doc.refreshProjection()
+        return {"status": "ok", "name": mask.name(), "id": mask.uniqueId().toString(), "type": mask.type()}
+
+    def cmd_set_filter_mask_filter(self, params):
+        """Swap an existing filter mask's filter and/or config in place — the actual point of
+        "non-destructive": re-edit the effect without deleting and recreating the mask."""
+        mask_name = params.get("mask")
+        filter_name = params.get("filter")
+        if not filter_name:
+            return {"error": "No filter name specified"}
+
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+
+        mask = self.find_node(doc, mask_name)
+        if not mask or mask.type() != "filtermask":
+            return {"error": f"Filter mask not found: {mask_name}"}
+
+        filt = Krita.instance().filter(filter_name)
+        if not filt:
+            return {"error": f"Unknown filter: {filter_name}. See list_filters for valid names."}
+
+        config = params.get("config")
+        if config:
+            info = InfoObject()
+            info.setProperties(config)
+            filt.setConfiguration(info)
+
+        mask.setFilter(filt)
+        doc.refreshProjection()
+        return {"status": "ok", "mask": mask_name, "filter": filter_name}
 
     def cmd_delete_layer(self, params):
         """Remove a layer by name."""
@@ -1232,7 +1405,7 @@ class KritaMCPExtension(Extension):
         parent = node.parentNode() or doc.rootNode()
         parent.addChildNode(dup, node)
         doc.refreshProjection()
-        return {"status": "ok", "name": dup.name()}
+        return {"status": "ok", "name": dup.name(), "id": dup.uniqueId().toString()}
 
     def cmd_reorder_layer(self, params):
         """Move a layer one step up or down within its parent's stacking order."""
@@ -1267,6 +1440,70 @@ class KritaMCPExtension(Extension):
         parent.addChildNode(node, target)
         doc.refreshProjection()
         return {"status": "ok", "name": params.get("name"), "direction": direction}
+
+    def cmd_scale_layer(self, params):
+        """Resample a layer to new pixel dimensions in place (top-left corner stays fixed).
+
+        Node.scaleNode() (and rotateNode/cropNode/shearNode below) already call
+        image->waitForDone() internally at the C++ level before returning — unlike
+        ColorizeMask.updateMask(), these are synchronous from Python's perspective and need no
+        extra doc.waitForDone() of our own.
+        """
+        doc = self.get_active_document()
+        layer_name = params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        width, height = params.get("width"), params.get("height")
+        if not width or not height:
+            return {"error": "width and height are required"}
+        strategy = params.get("strategy", "Bicubic")
+        bounds = node.bounds()
+        node.scaleNode(QPointF(bounds.x(), bounds.y()), int(width), int(height), strategy)
+        doc.refreshProjection()
+        return {"status": "ok", "name": node.name(), "width": width, "height": height}
+
+    def cmd_rotate_layer(self, params):
+        """Rotate a layer in place around its own center."""
+        doc = self.get_active_document()
+        layer_name = params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        degrees = params.get("degrees")
+        if degrees is None:
+            return {"error": "degrees is required"}
+        node.rotateNode(math.radians(degrees))
+        doc.refreshProjection()
+        return {"status": "ok", "name": node.name(), "degrees": degrees}
+
+    def cmd_crop_layer(self, params):
+        """Crop a layer's content to a rectangle (in document coordinates)."""
+        doc = self.get_active_document()
+        layer_name = params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        x, y = params.get("x", 0), params.get("y", 0)
+        width, height = params.get("width"), params.get("height")
+        if not width or not height:
+            return {"error": "width and height are required"}
+        node.cropNode(int(x), int(y), int(width), int(height))
+        doc.refreshProjection()
+        return {"status": "ok", "name": node.name(), "x": x, "y": y, "width": width, "height": height}
+
+    def cmd_shear_layer(self, params):
+        """Shear a layer in place. angle_x/angle_y are in degrees (confirmed against Krita's own
+        libs/image/kis_image.cc: 'angleX, angleY are in degrees')."""
+        doc = self.get_active_document()
+        layer_name = params.get("name")
+        node = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not node:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+        angle_x, angle_y = params.get("angle_x", 0), params.get("angle_y", 0)
+        node.shearNode(float(angle_x), float(angle_y))
+        doc.refreshProjection()
+        return {"status": "ok", "name": node.name(), "angle_x": angle_x, "angle_y": angle_y}
 
     def cmd_set_layer_clipping(self, params):
         """
@@ -1455,9 +1692,30 @@ class KritaMCPExtension(Extension):
                 return {"error": "No active document"}
         closed_name = target.name()
         # Guard against a "save changes?" prompt blocking the event loop, same as export_layer.
+        # setBatchmode(True) alone isn't reliable for this on every Krita build (confirmed live
+        # on 6.0.3/Qt6 — the prompt still appeared with only that set) -- setModified(False)
+        # makes Krita's own dirty-check see nothing to save in the first place, which is the
+        # actual condition the prompt keys off, and is a more direct fix than batchmode.
+        target.setModified(False)
         target.setBatchmode(True)
         target.close()
         return {"status": "ok", "name": closed_name}
+
+    def cmd_quit(self, params):
+        """
+        Cleanly quit Krita: close every open document without prompting to save, then quit the
+        application. For unattended/scripted restarts (e.g. after a plugin-code change) where no
+        human is present to click a save-changes or session-recovery dialog -- closing documents
+        properly (vs. killing the process mid-session) also avoids Krita treating the next launch
+        as crash recovery.
+        """
+        app = Krita.instance()
+        for doc in list(app.documents()):
+            doc.setModified(False)
+            doc.setBatchmode(True)
+            doc.close()
+        QApplication.instance().quit()
+        return {"status": "ok"}
 
     def cmd_resize_canvas(self, params):
         """Resize the canvas (repositions the content origin; does not scale pixels)."""
@@ -1480,6 +1738,41 @@ class KritaMCPExtension(Extension):
         doc.crop(x, y, w, h)
         doc.refreshProjection()
         return {"status": "ok", "x": x, "y": y, "width": w, "height": h}
+
+    def cmd_scale_canvas(self, params):
+        """Resample the whole canvas to new pixel dimensions (all layers), preserving DPI."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        width, height = params.get("width"), params.get("height")
+        if not width or not height:
+            return {"error": "width and height are required"}
+        strategy = params.get("strategy", "Bicubic")
+        doc.scaleImage(int(width), int(height), int(doc.xRes()), int(doc.yRes()), strategy)
+        doc.refreshProjection()
+        return {"status": "ok", "width": width, "height": height}
+
+    def cmd_rotate_canvas(self, params):
+        """Rotate the whole canvas (all layers), resizing the canvas to fit."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        degrees = params.get("degrees")
+        if degrees is None:
+            return {"error": "degrees is required"}
+        doc.rotateImage(math.radians(degrees))
+        doc.refreshProjection()
+        return {"status": "ok", "degrees": degrees}
+
+    def cmd_shear_canvas(self, params):
+        """Shear the whole canvas (all layers). angle_x/angle_y are in degrees."""
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+        angle_x, angle_y = params.get("angle_x", 0), params.get("angle_y", 0)
+        doc.shearImage(float(angle_x), float(angle_y))
+        doc.refreshProjection()
+        return {"status": "ok", "angle_x": angle_x, "angle_y": angle_y}
 
     def cmd_flatten_image(self, params):
         """Flatten all layers into one."""
@@ -1512,7 +1805,7 @@ class KritaMCPExtension(Extension):
             return {"error": f"Layer '{node.name()}' has no content to export"}
 
         pixel_data = node.pixelData(bounds.x(), bounds.y(), bounds.width(), bounds.height())
-        image = QImage(pixel_data, bounds.width(), bounds.height(), QImage.Format_ARGB32)
+        image = QImage(pixel_data, bounds.width(), bounds.height(), QIMAGE_FORMAT_ARGB32)
         if not image.save(path):
             return {"error": f"Failed to save image to {path}"}
 
@@ -1701,7 +1994,7 @@ class KritaMCPExtension(Extension):
         if x < 0 or y < 0 or x + w > doc.width() or y + h > doc.height():
             return {"error": f"Stamp at ({x},{y}) {w}x{h} doesn't fit within the {doc.width()}x{doc.height()} canvas"}
 
-        image = QImage(w, h, QImage.Format_ARGB32)
+        image = QImage(w, h, QIMAGE_FORMAT_ARGB32)
         image.fill(0)
         painter = QPainter(image)
         renderer.render(painter)
@@ -1758,6 +2051,135 @@ class KritaMCPExtension(Extension):
             "used_action": blank_frame_action.text() if blank_frame_action else None,
             "frames": results,
         }
+
+    def cmd_create_colorize_mask(self, params):
+        """
+        Create a Colorize Mask on a layer: paint "key strokes" of distinct colors over line art
+        and Krita's own lazy-fill segmentation flat-fills every enclosed region in one pass —
+        strictly better than flood_fill for coloring line art (handles every region at once,
+        tolerant of small gaps in the linework).
+
+        Unlike every other pixel-writing command in this file, ColorizeMask.setKeyStrokePixelData
+        writes into an alpha8 (1 byte per pixel = coverage 0-255) paint device internal to the
+        mask, NOT the BGRA format used by setPixelData/pixelData elsewhere — confirmed against
+        Krita's own libs/libkis/ColorizeMask.cpp and libs/libkis/tests/TestDocument.cpp
+        (testCreateColorizeMask), which this implementation's call sequence mirrors: create mask,
+        parent it under the target layer, tune edge-detection/clean-up, initializeKeyStrokeColors
+        ONCE with the full color list, then setKeyStrokePixelData per color/region, then
+        updateMask().
+
+        Not yet tested against a live Krita instance — see TASKS.md before relying on this in a
+        real workflow.
+        """
+        key_strokes = params.get("key_strokes")
+        if not key_strokes:
+            return {"error": "key_strokes must be a non-empty list"}
+
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+
+        layer_name = params.get("layer")
+        target = self.find_node(doc, layer_name) if layer_name else self.get_active_layer()
+        if not target:
+            return {"error": f"Layer not found: {layer_name}" if layer_name else "No active layer"}
+
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+
+        name = params.get("name", "Colorize Mask")
+        mask = doc.createColorizeMask(name)
+        if not mask:
+            return {"error": "Failed to create colorize mask"}
+
+        target.addChildNode(mask, None)
+        mask.setEditKeyStrokes(True)
+        mask.setUseEdgeDetection(bool(params.get("edge_detection", False)))
+        mask.setEdgeDetectionSize(float(params.get("edge_detection_size", 4.0)))
+        mask.setCleanUpAmount(float(params.get("clean_up_amount", 0.0)))
+        mask.setLimitToDeviceBounds(bool(params.get("limit_to_device_bounds", False)))
+
+        managed_colors = []
+        transparent_index = -1
+        for i, ks in enumerate(key_strokes):
+            color_hex = ks.get("color")
+            if not color_hex:
+                return {"error": f"key_strokes[{i}] is missing 'color'"}
+            managed_colors.append(ManagedColor.fromQColor(QColor(color_hex), view.canvas()))
+            if ks.get("transparent"):
+                transparent_index = i
+
+        # Sets the mask's own color space to match its parent layer as a side effect — must run
+        # exactly once, before any setKeyStrokePixelData call (mirrors Krita's own C++ test order).
+        mask.initializeKeyStrokeColors(managed_colors, transparent_index)
+
+        for i, ks in enumerate(key_strokes):
+            color = managed_colors[i]
+            for rect in ks.get("rects", []):
+                if len(rect) != 4:
+                    return {"error": f"key_strokes[{i}].rects entries must be [x, y, w, h]"}
+                x, y, w, h = (int(v) for v in rect)
+                if w <= 0 or h <= 0:
+                    continue
+                coverage = bytes([255]) * (w * h)
+                if not mask.setKeyStrokePixelData(coverage, color, x, y, w, h):
+                    return {"error": f"Failed to write key stroke for key_strokes[{i}]"}
+
+        mask.updateMask(True)
+        mask.setEditKeyStrokes(False)
+        mask.setShowOutput(True)
+        # updateMask() runs the lazy-fill segmentation as an async job on Krita's own image
+        # update scheduler, not on Qt's event loop -- QApplication.processEvents() (used
+        # elsewhere in this file for the setCurrentTime race) does NOT wait for it.
+        # doc.waitForDone() is the actual sync barrier; confirmed against Krita's own
+        # libs/libkis/tests/TestDocument.cpp::testCreateColorizeMask, which calls it in this
+        # exact position (after updateMask()/setShowOutput(), before refreshProjection()).
+        doc.waitForDone()
+        doc.refreshProjection()
+
+        return {"status": "ok", "name": mask.name(), "id": mask.uniqueId().toString(), "key_stroke_count": len(key_strokes)}
+
+    def cmd_update_colorize_mask(self, params):
+        """Repaint one already-registered key-stroke color's coverage on an existing colorize
+        mask (see cmd_create_colorize_mask) and optionally re-run the fill."""
+        mask_name = params.get("mask")
+        color_hex = params.get("color")
+        rects = params.get("rects", [])
+
+        doc = self.get_active_document()
+        if not doc:
+            return {"error": "No active document"}
+
+        mask = self.find_node(doc, mask_name)
+        if not mask or mask.type() != "colorizemask":
+            return {"error": f"Colorize mask not found: {mask_name}"}
+
+        view = self.get_active_view()
+        if not view:
+            return {"error": "No active view"}
+
+        color = ManagedColor.fromQColor(QColor(color_hex), view.canvas())
+        mask.setEditKeyStrokes(True)
+        for rect in rects:
+            if len(rect) != 4:
+                return {"error": "rects entries must be [x, y, w, h]"}
+            x, y, w, h = (int(v) for v in rect)
+            if w <= 0 or h <= 0:
+                continue
+            coverage = bytes([255]) * (w * h)
+            if not mask.setKeyStrokePixelData(coverage, color, x, y, w, h):
+                return {"error": f"Color {color_hex} was not registered on this mask — "
+                                 f"add it via create_colorize_mask's key_strokes first"}
+
+        if params.get("update", True):
+            mask.updateMask(True)
+        mask.setEditKeyStrokes(False)
+        mask.setShowOutput(True)
+        doc.waitForDone()  # see cmd_create_colorize_mask -- updateMask() is an async scheduler job
+        doc.refreshProjection()
+
+        return {"status": "ok", "mask": mask_name, "color": color_hex}
 
 
 # Register the extension
